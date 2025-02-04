@@ -8,12 +8,15 @@ from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
 from utils.io import load_sdr, load_hdr
+from utils.graphic_utils import *
 
 class CELEBAPBR(Dataset):
     def __init__(self, configs, mode):
         super().__init__()
 
-        self.width, self.height = configs.image_size
+        self.configs = configs
+        self.width = configs.image_width
+        self.height = configs.image_height
         
         self.data_dir = configs.data_dir
         
@@ -36,9 +39,21 @@ class CELEBAPBR(Dataset):
         elif mode == 'eval':
             self.data_list = self.gt_indices_list[train_num:]
         
-        # Load pred fov
-        with open(configs.fov_file_dir, 'r') as f:
+        # Load predicted fov
+        with open(configs.data_dir + '/pred_fov.json', 'r') as f:
             self.pred_fov_dict = json.load(f)
+        
+        # Load view pos
+        with open(configs.data_dir + '/CelebAMask-HQ-pose-anno.txt', 'r') as f:
+            pose_list = f.readlines()
+        
+        # Phase view pos
+        pose_list.pop(0)
+        pose_list.pop(0)
+        self.pose_dict = {}
+        for item in pose_list:
+            item = item.replace('\n', '')
+            self.pose_dict[item.split(' ')[0].split('.')[0].zfill(5)] = item.split(' ')[1:]
     
     def _get_meta_data_list(self):
         
@@ -69,29 +84,65 @@ class CELEBAPBR(Dataset):
         normal_gt = (normal_gt * 2 - 1.).float()
         depth_gt = load_hdr(os.path.join(self.depth_dir, f'{data_index}_depth.exr'), resize=(self.width, self.height))[...,0]
         hdri_gt = load_hdr(os.path.join(self.hdri_dir, f'{data_index}_hdri.exr'), resize=False)
-        mask_gt = load_sdr(os.path.join(self.mask_dir, f'{data_index}_mask.png'), resize=(self.width, self.height))
+        mask_gt = load_sdr(os.path.join(self.mask_dir, f'{data_index}_mask.png'), resize=(self.width, self.height))[...,0].bool()
         
-        # Get view pos from estimated fov
-        pred_fov = self.pred_fov_dict[str(data_index)]
+        # Get view coordinates from estimated fov
+        fov_gt = self.pred_fov_dict[str(data_index)]
+        v_coords_gt = self.get_view_coords(depth_gt, self.width, self.height, fov_gt)
         
-        pos_in_cam_gt = self.get_cam_pos(depth=depth_gt, width=self.width, height=self.height, fov=pred_fov)
+        # Get clip coordinates
+        # P = get_projection_matrix(self.configs.z_near, self.configs.z_far, fov_gt, fov_gt)
+        # view_coords_homo = coords2homo(view_coords_gt)
+        # clip_coords = torch.matmul(P, view_coords_homo[...,None]).squeeze(-1)
+        
+        # Get yaw, pitch, roll angles
+        pose_gt = torch.tensor([float(item) for item in self.pose_dict[data_index]])
+        
+        # Set white background for each data
+        inverted_mask = ~mask_gt
+        masked_bg = inverted_mask.float().unsqueeze(-1)
+        rgb_gt = rgb_gt + masked_bg
+        albedo_gt = albedo_gt + masked_bg
+        roughness_gt = roughness_gt.unsqueeze(-1) + masked_bg
+        specular_gt = specular_gt.unsqueeze(-1) + masked_bg
+        normal_gt = normal_gt + masked_bg
+        depth_gt = depth_gt.unsqueeze(-1) + masked_bg
+        v_coords_gt = v_coords_gt + masked_bg
+        
+        # data shape: [H, W, C]
+        # data_buffer = {
+        #     'rgb': rgb_gt.reshape(-1, 3),
+        #     'normal': normal_gt.reshape(-1, 3),
+        #     'albedo': albedo_gt.reshape(-1, 3),
+        #     'roughness': roughness_gt.reshape(-1, 1),
+        #     'specular': specular_gt.reshape(-1, 1),
+        #     'depth': depth_gt.reshape(-1, 1),
+        #     'v_coords': v_coords_gt.reshape(-1, 3),
+        #     'mask': mask_gt.reshape(-1, 1).int(),
+        #     'hdri': hdri_gt,
+        #     'pose': pose_gt,
+        #     #'fov': fov_gt,
+        #     'file_index': str(data_index)
+        # }
         
         data_buffer = {
-            'rgb_gt': rgb_gt.permute(2, 0, 1),
-            'normal_gt': normal_gt.permute(2, 0, 1),
-            'albedo_gt': albedo_gt.permute(2, 0, 1),
-            'roughness_gt': roughness_gt[...,None].permute(2, 0, 1),
-            'specular_gt': specular_gt[...,None].permute(2, 0, 1),
-            'depth_gt': depth_gt[...,None].permute(2, 0, 1),
-            'pos_in_cam_gt': pos_in_cam_gt.permute(2, 0, 1),
-            'mask_gt': mask_gt.permute(2, 0, 1),
-            'hdri_gt': hdri_gt.permute(2, 0, 1),
+            'rgb': rgb_gt,
+            'normal': normal_gt,
+            'albedo': albedo_gt,
+            'roughness': roughness_gt,
+            'specular': specular_gt,
+            'depth': depth_gt,
+            'v_coords': v_coords_gt,
+            'mask': mask_gt.int(),
+            'hdri': hdri_gt,
+            'pose': pose_gt,
+            #'fov': fov_gt,
             'file_index': str(data_index)
         }
         
         return data_buffer
     
-    def get_cam_pos(self, depth, width, height, fov):
+    def get_view_coords(self, depth, width, height, fov):
         fovx = math.radians(fov)
         fovy = 2 * math.atan(math.tan(fovx / 2) / (width / height))
         vpos = torch.zeros(height, width, 3)
@@ -112,7 +163,7 @@ def get_dataloader(configs):
     
     torch.manual_seed(random_seed)
     torch.cuda.manual_seed(random_seed)
-    torch.cuda.manual_seed_all(random_seed) 
+    torch.cuda.manual_seed_all(random_seed)
     np.random.seed(random_seed)
     random.seed(random_seed)
     
@@ -123,7 +174,7 @@ def get_dataloader(configs):
     train_loader = DataLoader(train_dataset, 
                               batch_size=configs.train_batch_size, 
                               shuffle=True, 
-                              num_workers=4,
+                              num_workers=0,
                               worker_init_fn=worker_init_fn,
                               pin_memory=True)
     
@@ -131,7 +182,7 @@ def get_dataloader(configs):
     eval_loader = DataLoader(eval_dataset, 
                              batch_size=configs.eval_batch_size, 
                              shuffle=True, 
-                             num_workers=4,
+                             num_workers=0,
                              worker_init_fn=worker_init_fn,
                              pin_memory=True)
     

@@ -8,9 +8,9 @@ import cv2 as cv
 import warnings
 warnings.filterwarnings('ignore')
 
-from models.decalib.deca import DECA
-from models.decalib.utils.config import cfg as deca_cfg
-from models.decalib.datasets.detectors import FAN
+from third_party.decalib.deca import DECA
+from third_party.decalib.utils.config import cfg as deca_cfg
+from third_party.decalib.datasets.detectors import FAN
 
 def preprocess(data_dir):
     

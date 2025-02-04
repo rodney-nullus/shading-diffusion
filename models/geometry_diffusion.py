@@ -5,7 +5,7 @@ from diffusers import AutoencoderKL, UNet2DConditionModel, EulerAncestralDiscret
 from diffusers.image_processor import VaeImageProcessor
 from transformers import CLIPTextModel, CLIPTextModelWithProjection
 
-class ShadingDiffusion(nn.Module):
+class GeometryDiffusion(nn.Module):
     def __init__(self, configs, load_loacl=False):
         super().__init__()
         
@@ -21,11 +21,11 @@ class ShadingDiffusion(nn.Module):
         pretrained_vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-turbo", subfolder="vae")
         
         # Change the number of input channels of encoder
-        pretrained_vae.encoder.conv_in = nn.Conv2d(6, pretrained_vae.encoder.conv_in.out_channels, 
+        pretrained_vae.encoder.conv_in = nn.Conv2d(configs.geo_diff_inchns, pretrained_vae.encoder.conv_in.out_channels, 
                                                    kernel_size=3, stride=1, padding=1)
         
         # Change the number of output channels of decoder
-        pretrained_vae.decoder.conv_out = nn.Conv2d(pretrained_vae.decoder.conv_out.in_channels, 6,
+        pretrained_vae.decoder.conv_out = nn.Conv2d(pretrained_vae.decoder.conv_out.in_channels, configs.geo_diff_outchns,
                                                     kernel_size=3, stride=1, padding=1)
         
         # Freeze all parameters except customized layers
@@ -52,7 +52,11 @@ class ShadingDiffusion(nn.Module):
     
     def vae_forward(self, x, return_latent=False):
         
+        latents = self.vae.encode(x).latent_dist
+        samples = latents.sample()
+        rec_x = self.vae.decode(samples).sample
         
+        if return_latent:
+            return rec_x, latents
         
-        
-        return self.vae(x)
+        return rec_x

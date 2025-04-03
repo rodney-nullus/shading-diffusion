@@ -1,0 +1,33 @@
+{   
+    "exp_name": "shading-diff-pbnds",
+    "model": {
+        "use_ldr_image": false,
+        "resolution": [128, 128]
+    },
+    "train": {
+        "batch_size": 1,
+        "crop_size": null,
+        "num_pixel_samples": 8192,
+        "num_light_samples": 128,
+        "initial_lr": 5e-5,
+        "total_epochs": 40,
+        "data_folder": "data_loader",
+        "output_folder": "experiments",
+        "pretrained_weights": null
+    },
+    "evaluation": {
+        "validation_indexes": [
+            9,
+            18,
+            30,
+            41,
+            50,
+            62,
+            73,
+            82,
+            94
+        ],
+        "plot_frequency": 10000,
+        "save_frequency": 10000
+    }
+}

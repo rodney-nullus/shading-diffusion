@@ -1,4 +1,5 @@
-import os, json, argparse
+import sys, os, json, argparse
+sys.path.append('.')
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -80,13 +81,13 @@ def preprocess(data_dir):
             
             codedict = deca.encode(torch.tensor(dst_image).float().cuda()[None])
             
-            pred_fov = torch.arctan(image.shape[1]/(2*codedict['cam'][0, 0])) / torch.pi * 180
+            pred_fov = 2 * torch.arctan(1/codedict['cam'][0, 0]) / torch.pi * 180
             
             pred_fov_dict[str(gt_indices_list[i])] = pred_fov.item()
         
     json_obj = json.dumps(pred_fov_dict, indent=4)
     
-    with open(os.path.join(data_dir, 'pred_fov.json'), 'w') as outfile:
+    with open(os.path.join(data_dir, f'pred_fov.json'), 'w') as outfile:
         outfile.write(json_obj)
     
 def bbox2point(left, right, top, bottom, type='bbox'):

@@ -8,7 +8,7 @@
             "name": "Preprocessor Debug",
             "type": "debugpy",
             "request": "launch",
-            "program": "data_preprocess.py",
+            "program": "preprocess/data_preprocess.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": [
@@ -16,10 +16,74 @@
             ]
         },
         {
+            "name": "VLM Preprocessor Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "preprocess/vlm_preprocess.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
             "name": "Trainer Debug",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "exp_debug",
+                "--train_model", "geo-diff",
+                "--train_phase", "vae",
+                "--train_batch_size", "2"
+            ]
+        },
+        // {
+        //     "name": "train_test",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "program": "train_text_to_image_sdxl.py",
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "args": [
+        //         "--pretrained_model_name_or_path", "stabilityai/stable-diffusion-xl-base-1.0",
+        //         "--pretrained_vae_model_name_or_path", "madebyollin/sdxl-vae-fp16-fix",
+        //         "--dataset_name", "lambdalabs/naruto-blip-captions",
+        //         "--enable_xformers_memory_efficient_attention",
+        //         "--resolution", "32",
+        //         "--center_crop",
+        //         "--random_flip",
+        //         "--proportion_empty_prompts", "0.2",
+        //         "--train_batch_size", "1", 
+        //         "--gradient_accumulation_steps", "4",
+        //         "--gradient_checkpointing",
+        //         "--max_train_steps", "10000",
+        //         "--learning_rate", "1e-06",
+        //         "--lr_scheduler", "constant",
+        //         "--lr_warmup_steps", "0",
+        //         "--mixed_precision", "fp16",
+        //         "--report_to", "wandb",
+        //         "--validation_prompt", "a cute Sundar Pichai creature",
+        //         "--validation_epochs", "5",
+        //         "--checkpointing_steps", "5000",
+        //         "--output_dir", "sdxl-naruto-model"
+        //     ]
+        // },
+        {
+            "name": "Test Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "test/test_inverse_rot_simple.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+            ]
+        },
+        {
+            "name": "vea_pipeline debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "inference/vae_pipeline.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": [

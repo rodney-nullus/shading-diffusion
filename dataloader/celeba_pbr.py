@@ -63,7 +63,7 @@ class CELEBAPBR(Dataset):
             self.pose_dict[item.split(" ")[0].split(".")[0].zfill(5)] = item.split(" ")[1:]
 
         # Load prompt data
-        with open(configs.data_dir + "/data_prompt.json", "r") as f:
+        with open(configs.data_dir + "/data_prompt_en.json", "r") as f:
             self.prompt_dict = json.load(f)
     
     def _get_meta_data_list(self):

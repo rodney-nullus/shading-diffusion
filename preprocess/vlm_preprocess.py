@@ -15,7 +15,7 @@ from torch.utils.data.dataloader import DataLoader
 from deepseek_vl2.models import DeepseekVLV2Processor, DeepseekVLV2ForCausalLM
 from deepseek_vl2.utils.io import load_pil_images
 
-from configs.configs import Configs
+from configs.configs_unet import Configs
 
 def preprocess(configs):
     

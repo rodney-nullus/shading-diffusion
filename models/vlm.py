@@ -21,7 +21,7 @@ class VLM(nn.Module):
         model_path = "deepseek-ai/deepseek-vl2-tiny"
         
         # Load model
-        self.vl_chat_processor: DeepseekVLV2Processor = DeepseekVLV2Processor.from_pretrained(model_path)
+        self.vl_chat_processor: DeepseekVLV2Processor = DeepseekVLV2Processor.from_pretrained("deepseek-ai/deepseek-vl2-tiny")
         self.tokenizer = self.vl_chat_processor.tokenizer
         self.bos_token_id = self.tokenizer.bos_token_id
         self.eos_token_id = self.tokenizer.eos_token_id

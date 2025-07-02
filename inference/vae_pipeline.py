@@ -10,7 +10,7 @@ from safetensors.torch import load_model
 
 from models.geometry_diffusion import GeometryDiffusion
 from dataloader.celeba_pbr import get_dataloader
-from configs.configs import Configs
+from configs.configs_unet import Configs
 
 def vae_pipeline(configs, vae_model, data_loader, mode, num_samples, device):
     

@@ -7,14 +7,12 @@ from tqdm import tqdm
 import torch
 import torchvision.transforms.functional as tvf
 
-from dataloader.celeba_pbr import CELEBAPBR
+from test_loader import TEST
 from torch.utils.data.dataloader import DataLoader
-
-from configs.configs import Configs
 
 from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 
-def test(configs, cot=False):
+def test(cot=False):
     
     # specify the path to the model
     model_path_7b = "llava-hf/llava-v1.6-mistral-7b-hf"
@@ -24,21 +22,21 @@ def test(configs, cot=False):
     model.to("cuda:0")
     
     # Load dataloader
-    celeba_dataset = CELEBAPBR(configs, mode='all')
-    celeba_loader = DataLoader(celeba_dataset, 
+    test_dataset = TEST()
+    test_loader = DataLoader(test_dataset, 
                                batch_size=1, 
                                shuffle=False, 
-                               num_workers=configs.num_workers,
+                               num_workers=1,
                                pin_memory=True)
     
     answer_dict = dict()
-    dataset_iter = iter(celeba_loader)
+    dataset_iter = iter(test_loader)
     progress_bar = tqdm(range(10), ncols=90)
     for step in progress_bar:
         
         # Load data
         data = next(dataset_iter)
-        image = [tvf.to_pil_image(data['rgb'][0].permute(2,0,1))]
+        image = tvf.to_pil_image(data['rgb'][0].permute(2,0,1))
         
         if cot:
             prompt_gt = data['prompt_gt']
@@ -127,7 +125,5 @@ def test(configs, cot=False):
 
 if __name__ == '__main__':
     
-    configs = Configs()
-    
     with torch.no_grad():
-        test(configs, cot=False)
+        test(cot=False)

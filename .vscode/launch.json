@@ -33,8 +33,7 @@
             "console": "integratedTerminal",
             "args": [
                 "exp_debug",
-                "--train_model", "geo-diff",
-                "--train_phase", "vae",
+                "--train_phase", "unet",
                 "--train_batch_size", "2"
             ]
         },
@@ -73,8 +72,8 @@
             "name": "Test Debug",
             "type": "debugpy",
             "request": "launch",
-            "program": "test/test_inverse_rot_simple.py",
-            "cwd": "${workspaceFolder}",
+            "program": "test_vlm.py",
+            "cwd": "${workspaceFolder}/test",
             "console": "integratedTerminal",
             "args": [
             ]

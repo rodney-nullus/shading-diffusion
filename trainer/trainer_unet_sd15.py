@@ -29,11 +29,11 @@ from transformers import AutoModelForCausalLM
 from deepseek_vl2.models import DeepseekVLV2Processor, DeepseekVLV2ForCausalLM
 from models.projector import Projector
 
-from configs.configs_unet import Configs
+from configs.training_configs_unet import Configs
 
 from dataloader.celeba_pbr import get_dataloader
 
-from loss.mask_loss import BCEDiceBoundaryLoss
+from models.vae_shader import VAEShader
 
 class Trainer:
     def __init__(self, configs: Configs):
@@ -73,10 +73,7 @@ class Trainer:
             log_with="tensorboard"
         )
         self.device = self.accelerator.device
-        if configs.train_phase == "vae":
-            self.accelerator.init_trackers("vae_run", config={})
-        elif configs.train_phase == "unet":
-            self.accelerator.init_trackers("unet_run", config={})
+        self.accelerator.init_trackers("unet_run", config={})
         
         # Disable AMP for MPS.
         if torch.backends.mps.is_available():
@@ -128,10 +125,6 @@ class Trainer:
                 "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
             )
         
-        # Load training components
-        # Load dataloader
-        train_loader, eval_loader = get_dataloader(configs)
-        
         # Load deepseek vl2
         self.vl_chat_processor: DeepseekVLV2Processor = DeepseekVLV2Processor.from_pretrained("deepseek-ai/deepseek-vl2-tiny")
         self.vl_chat_processor.tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
@@ -146,30 +139,44 @@ class Trainer:
         self.do_sample = configs.do_sample
         self.use_cache = configs.use_cache
         
-        # Load vae with pretrained weights
-        vae: AutoencoderKL = AutoencoderKL.from_pretrained(configs.pretrained_model_name_or_path, subfolder="vae")
+        # Load dataloader
+        train_loader, eval_loader = get_dataloader(configs)
         
-        # Change the number of input channels of vae encoder
-        conv_in_out_chns = vae.encoder.conv_in.out_channels
-        vae.encoder.conv_in = nn.Conv2d(configs.geo_diff_inchns, conv_in_out_chns, kernel_size=3, stride=1, padding=1)
+        self.total_train_epochs = configs.total_train_epochs
+        self.num_update_steps_per_epoch = math.ceil(len(train_loader) / configs.gradient_accumulation_steps)
+        self.total_train_steps = self.total_train_epochs * self.num_update_steps_per_epoch
+        self.total_batch_size = configs.train_batch_size * self.accelerator.num_processes * configs.gradient_accumulation_steps
         
-        # Change the number of output channels of vae decoder
-        conv_out_in_chns = vae.decoder.conv_out.in_channels
-        vae.decoder.conv_out = nn.Conv2d(conv_out_in_chns, configs.geo_diff_outchns,kernel_size=3, stride=1, padding=1)
+        vae_shader: VAEShader = VAEShader(configs=configs)
         
-        vae.enable_xformers_memory_efficient_attention()
+        # Intrinsics head: predicts focal length (f) and principal point offsets (cx, cy)
+        # We global-pool features and regress 3 values
+        intrinsic_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),   # [B,C,1,1]
+            nn.Flatten(),              # [B,C]
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)           # [f, cx, cy]
+        )
         
+        # Load pretrained weights from vae phase
         dirs = os.listdir(self.checkpoints_dir)
-        dirs = [d for d in dirs if d.startswith(f"checkpoint-{configs.train_model[:3]}-vae")]
-        dirs = sorted(dirs, key=lambda x: int(x.split("-")[3]))
+        dirs = [d for d in dirs if d.startswith(f"checkpoint-vae")]
+        dirs = sorted(dirs, key=lambda x: int(x.split("-")[2]))
         path = dirs[-1] if len(dirs) > 0 else None
         
         if path is not None:
-            weight_path = f"{self.checkpoints_dir}/{path}/model.safetensors"
-            load_model(vae, weight_path)
+            vae_weight_path = f"{self.checkpoints_dir}/{path}/model.safetensors"
+            intrinsic_net_weight_path = f"{self.checkpoints_dir}/{path}/model_1.safetensors"
+            load_model(vae_shader.vae, vae_weight_path)
+            load_model(intrinsic_net, intrinsic_net_weight_path)
         
         # Load tokenizer
-        self.tokeinzer = CLIPTokenizer.from_pretrained(
+        self.tokenizer = CLIPTokenizer.from_pretrained(
             configs.pretrained_model_name_or_path,
             subfolder="tokenizer",
             use_fast=False,
@@ -206,12 +213,12 @@ class Trainer:
         
         # freeze parameters of models to save more memory
         unet.requires_grad_(True)
-        vae.requires_grad_(False)
+        vae_shader.vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
         
         # Move unet, vae and text_encoder to device and cast to weight_dtype
         unet.to(self.accelerator.device, dtype=self.weight_dtype)
-        vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        vae_shader.vae.to(self.accelerator.device, dtype=self.weight_dtype)
         text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
         
         if configs.enable_xformers_memory_efficient_attention:
@@ -253,7 +260,7 @@ class Trainer:
             len_train_dataloader_after_sharding = math.ceil(len(train_loader) / self.accelerator.num_processes)
             num_update_steps_per_epoch = math.ceil(len_train_dataloader_after_sharding / configs.gradient_accumulation_steps)
             num_training_steps_for_scheduler = (
-                configs.num_train_epochs * num_update_steps_per_epoch * self.accelerator.num_processes
+                configs.total_train_epochs * num_update_steps_per_epoch * self.accelerator.num_processes
             )
         else:
             num_training_steps_for_scheduler = configs.max_train_steps * self.accelerator.num_processes
@@ -268,14 +275,15 @@ class Trainer:
         # Prepare everything
         # There is no specific order to remember, you just need to unpack the
         # objects in the same order you gave them to the prepare method.
-        (self.vae,
+        (self.vae_shader,
          self.unet, 
+         self.intrinsic_net,
          self.text_encoder,
          self.optimizer, 
          self.lr_scheduler, 
          self.train_loader, 
          self.eval_loader) = self.accelerator.prepare(
-         vae, unet, text_encoder, optimizer, lr_scheduler, train_loader, eval_loader)
+             vae_shader, unet, intrinsic_net, text_encoder, optimizer, lr_scheduler, train_loader, eval_loader)
         
         self.train_resize = transforms.Resize((self.height, self.width), interpolation=transforms.InterpolationMode.BILINEAR)
         self.train_crop = transforms.CenterCrop((self.height, self.width)) if configs.center_crop else transforms.RandomCrop(configs.resolution)
@@ -285,18 +293,14 @@ class Trainer:
     def train(self):
         
         # Initial log
-        total_train_epochs = self.configs.num_train_epochs
-        total_batch_size = self.configs.train_batch_size * self.accelerator.num_processes * self.configs.gradient_accumulation_steps
-        num_update_steps_per_epoch = math.ceil(len(self.train_loader) / self.configs.gradient_accumulation_steps)
-
         self.logger.info("***** Running training *****")
         self.logger.info(f"  Num examples = {len(self.train_loader)}")
         
-        self.logger.info(f"  Num Epochs = {total_train_epochs}")
+        self.logger.info(f"  Num Epochs = {self.total_train_epochs}")
         self.logger.info(f"  Instantaneous batch size per device = {self.configs.train_batch_size}")
-        self.logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+        self.logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {self.total_batch_size}")
         self.logger.info(f"  Gradient Accumulation steps = {self.configs.gradient_accumulation_steps}")
-        self.logger.info(f"  Total optimization steps = {total_train_epochs * num_update_steps_per_epoch}")
+        self.logger.info(f"  Total optimization steps = {self.total_train_steps}")
         
         # Potentially load in the weights and states from a previous save
         if self.configs.resume_from_checkpoint:
@@ -322,9 +326,9 @@ class Trainer:
                 self.accelerator.load_state( os.path.join(self.checkpoints_dir, path))
                 global_step = int(path.split("-")[3])
 
-                self.initial_step = global_step % num_update_steps_per_epoch
+                self.initial_step = global_step % self.num_update_steps_per_epoch
                 self.global_step = global_step
-                current_epoch = global_step // num_update_steps_per_epoch
+                current_epoch = global_step // self.num_update_steps_per_epoch
 
         else:
             self.initial_step = 0
@@ -345,8 +349,15 @@ class Trainer:
                     with torch.no_grad():
                         self.eval_epoch()
                 
-                if current_epoch == total_train_epochs:
-                    break
+                assert self.configs.total_train_epochs is not None or self.configs.max_train_steps is not None
+                
+                if self.configs.total_train_epochs is not None:
+                    if current_epoch == self.total_train_epochs:
+                        break
+                elif self.configs.max_train_steps is not None:
+                    current_step = self.num_update_steps_per_epoch * current_epoch
+                    if current_step == self.configs.max_train_steps:
+                        break
                 
                 current_epoch += 1
         
@@ -358,7 +369,6 @@ class Trainer:
         train_iter = iter(self.train_loader)
         
         # Train loop for unet
-        self.vae.eval()
         self.unet.train()
         train_loss = 0.0
         progress_bar = tqdm(
@@ -378,7 +388,7 @@ class Trainer:
             
                 # Prompting
                 prompt_list = train_data["prompt"]
-                ids_list = []
+                prepare_list = []
                 with torch.no_grad():
                     for index, prompts in enumerate(zip(prompt_list[0], prompt_list[1], prompt_list[2], prompt_list[3], prompt_list[4])):
                         
@@ -429,34 +439,38 @@ class Trainer:
                             }
                         ]
                         
-                        processed_input = self.vl_chat_processor(
+                        prepare = self.vl_chat_processor.process_one(
                             conversations=instruction,
                             images=[],
-                            force_batchify=True,
+                            apply_sft_format=False,
+                            inference_mode=True,
                             system_prompt=system_prompt
-                        ).to(self.device)
-                        
-                        inputs_embeds = self.vl_gpt.prepare_inputs_embeds(**processed_input)
-                        
-                        # run model to get the response
-                        outputs = self.vl_gpt.language.generate(
-                            inputs_embeds=inputs_embeds,
-                            attention_mask=processed_input.attention_mask,
-                            pad_token_id=self.eos_token_id,
-                            bos_token_id=self.bos_token_id,
-                            eos_token_id=self.eos_token_id,
-                            max_new_tokens=self.max_new_tokens,
-                            do_sample=self.do_sample,
-                            use_cache=self.use_cache,
-                            temperature=self.configs.temperature,
-                            top_p=self.configs.top_p
                         )
-                        ids_list.append(outputs)
-                    output_ids = torch.cat(ids_list, dim=0)
+                        prepare_list.append(prepare)
+                    
+                    prepare_inputs = self.vl_chat_processor.batchify(prepare_list).to(self.device)
+                    
+                    inputs_embeds = self.vl_gpt.prepare_inputs_embeds(**prepare_inputs)
+                    
+                    # run model to get the response
+                    outputs = self.vl_gpt.language.generate(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=prepare_inputs.attention_mask,
+                        pad_token_id=self.eos_token_id,
+                        bos_token_id=self.bos_token_id,
+                        eos_token_id=self.eos_token_id,
+                        max_new_tokens=self.max_new_tokens,
+                        do_sample=self.do_sample,
+                        use_cache=self.use_cache,
+                        temperature=self.configs.temperature,
+                        top_p=self.configs.top_p
+                    )
+                    
+                    answers = self.vl_chat_processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
                     
                     # Prompt embedding
                     text_inputs = self.tokenizer(
-                        ["111"],
+                        answers,
                         padding="max_length",
                         max_length=self.tokenizer.model_max_length,
                         truncation=True,
@@ -586,13 +600,9 @@ class Trainer:
         eval_iter = iter(self.eval_loader)
         
         # Train loop for unet
-        if self.configs.train_phase == "vae":
-            self.vae.eval()
-        elif self.configs.train_phase == "unet":
-            self.vae.eval()
-            self.unet.eval()
+        self.unet.eval()
         eval_loss = 0.0
-        progress_bar = tqdm(range(100), ncols=90, disable=not self.accelerator.is_local_main_process)
+        progress_bar = tqdm(range(500), ncols=90, disable=not self.accelerator.is_local_main_process)
         for step in progress_bar:
             # Load data
             eval_data = next(eval_iter)

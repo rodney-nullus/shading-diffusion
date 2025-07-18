@@ -2,7 +2,7 @@ from typing import Union
 from dataclasses import dataclass
 
 @dataclass
-class Configs:
+class UNETConfigs:
     
     # Experiment settings
     pretrained_model_name_or_path: str = "sd-legacy/stable-diffusion-v1-5"

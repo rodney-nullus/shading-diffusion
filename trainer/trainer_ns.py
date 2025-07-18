@@ -66,22 +66,6 @@ class Trainer(object):
         while True:
             print(f'Epoch: {self.num_epoch}')
             
-            # Dynanmically change the learning rate
-            # if self.num_epoch >= 50:
-            #     self.adjust_learning_rate(self.adam_optimizer, 2e-5)
-            # elif self.num_epoch >= 100:
-            #     self.adjust_learning_rate(self.adam_optimizer, 5e-6)
-            # elif self.num_epoch >= 200:
-            #     self.adjust_learning_rate(self.adam_optimizer, 2e-6)
-            # elif self.num_epoch >= 300:
-            #     self.adjust_learning_rate(self.adam_optimizer, 1e-6)
-            
-            # Train epoch
-            # if self.num_epoch % self.cross_rate == 0:
-            #     self.train_epoch(cross=True)
-            # else:
-            #     self.train_epoch(cross=False)
-            
             self.train_epoch(cross=False)
             
             # Evaluation epoch

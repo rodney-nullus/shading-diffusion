@@ -10,12 +10,12 @@ from torch.utils.data import Dataset
 from util_io import load_sdr
 
 class TEST(Dataset):
-    def __init__(self):
+    def __init__(self, data_dir):
         super().__init__()
 
         self.width, self.height = 256, 256
         
-        self.data_list = self._get_meta_data_list("data")
+        self.data_list = self._get_meta_data_list(data_dir)
 
         # Load prompt data
         with open("data_prompt_en.json", "r") as f:
@@ -41,12 +41,12 @@ class TEST(Dataset):
         # Load texture data and do the preprocess (for the convenience of following operation, we set background of all data to 1.)
         rgb = load_sdr(f'data/{data_index}_masked_rgb.png', resize=(self.width, self.height))
         
-        # Load prompts
-        prompt_gt = self.prompt_dict[str(data_index)]
+        # # Load prompts
+        # prompt_gt = self.prompt_dict[str(data_index)]
         
         data_buffer = {
             "rgb": rgb,
-            "prompt": prompt_gt,
+            # "prompt": prompt_gt,
             "file_index": str(data_index)
         }
         

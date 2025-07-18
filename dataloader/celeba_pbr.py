@@ -12,8 +12,10 @@ from utils.io import load_sdr, load_hdr
 from utils.graphic_utils import *
 from utils.rotations import matrix_to_rotation_6d
 
+from configs.training_configs_vae import Configs
+
 class CELEBAPBR(Dataset):
-    def __init__(self, configs, mode):
+    def __init__(self, configs: Configs, mode):
         super().__init__()
 
         self.configs = configs
@@ -108,22 +110,22 @@ class CELEBAPBR(Dataset):
         
         # Get view coordinates from estimated fov
         fov = self.pred_fov_dict[str(data_index)]
-        v_coords = self.get_view_coords(depth, self.width, self.height, fov)
-        # View coordinates normalization
-        v_coords[...,:2] = v_coords[...,:2] / 80.
-        v_coords[...,2] = - v_coords[...,2] / 800.
+        cam_coords = self.get_cam_coords(depth, self.width, self.height, fov)
+        
+        # Camera coordinates normalization
+        cam_coords[...,:2] = cam_coords[...,:2] / 80.
+        cam_coords[...,2] = - cam_coords[...,2] / 800.
         depth_mask = (~(depth == 0)).float().unsqueeze(-1)
         geo_mask_bg = (depth == 0).float().unsqueeze(-1)
         depth = depth.unsqueeze(-1) * depth_mask + geo_mask_bg
-        v_coords = v_coords * depth_mask + geo_mask_bg
+        cam_coords = cam_coords * depth_mask + geo_mask_bg
+        
+        # Clip the depth between near and far plane
+        clipped_depth = torch.clamp(depth, min=self.configs.z_near, max=self.configs.z_far)
+        norm_depth = ((clipped_depth - self.configs.z_near) / (self.configs.z_far - self.configs.z_near)) * depth_mask
         
         # Load prompts
         prompt_gt = self.prompt_dict[str(data_index)]
-        
-        # Get clip coordinates
-        # P = get_projection_matrix(self.configs.z_near, self.configs.z_far, fov_gt, fov_gt)
-        # view_coords_homo = coords2homo(view_coords_gt)
-        # clip_coords = torch.matmul(P, view_coords_homo[...,None]).squeeze(-1)
         
         # Get yaw, pitch, roll angles
         pose_gt = torch.tensor([float(item) for item in self.pose_dict[data_index]])
@@ -135,15 +137,15 @@ class CELEBAPBR(Dataset):
         pitch = pitch / 180 * torch.pi
         roll = roll / 180 * torch.pi
         rotation_matrix = torch.zeros(3, 3)
-        rotation_matrix[0, 0] = torch.tensor(np.cos(yaw) * np.cos(pitch))
-        rotation_matrix[0, 1] = torch.tensor(np.cos(yaw) * np.sin(pitch) * np.sin(roll) - np.sin(yaw) * np.cos(roll))
-        rotation_matrix[0, 2] = torch.tensor(np.cos(yaw) * np.sin(pitch) * np.cos(roll) + np.sin(yaw) * np.sin(roll))
-        rotation_matrix[1, 0] = torch.tensor(np.sin(yaw) * np.cos(pitch))
-        rotation_matrix[1, 1] = torch.tensor(np.sin(yaw) * np.sin(pitch) * np.sin(roll) + np.cos(yaw) * np.cos(roll))
-        rotation_matrix[1, 2] = torch.tensor(np.sin(yaw) * np.sin(pitch) * np.cos(roll) - np.cos(yaw) * np.sin(roll))
-        rotation_matrix[2, 0] = torch.tensor(-np.sin(pitch))
-        rotation_matrix[2, 1] = torch.tensor(np.cos(pitch) * np.sin(roll))
-        rotation_matrix[2, 2] = torch.tensor(np.cos(pitch) * np.cos(roll))
+        rotation_matrix[0, 0] = torch.cos(yaw) * torch.cos(pitch)
+        rotation_matrix[0, 1] = torch.cos(yaw) * torch.sin(pitch) * torch.sin(roll) - torch.sin(yaw) * torch.cos(roll)
+        rotation_matrix[0, 2] = torch.cos(yaw) * torch.sin(pitch) * torch.cos(roll) + torch.sin(yaw) * torch.sin(roll)
+        rotation_matrix[1, 0] = torch.sin(yaw) * torch.cos(pitch)
+        rotation_matrix[1, 1] = torch.sin(yaw) * torch.sin(pitch) * torch.sin(roll) + torch.cos(yaw) * torch.cos(roll)
+        rotation_matrix[1, 2] = torch.sin(yaw) * torch.sin(pitch) * torch.cos(roll) - torch.cos(yaw) * torch.sin(roll)
+        rotation_matrix[2, 0] = -torch.sin(pitch)
+        rotation_matrix[2, 1] = torch.cos(pitch) * torch.sin(roll)
+        rotation_matrix[2, 2] = torch.cos(pitch) * torch.cos(roll)
         
         rotation_6D = matrix_to_rotation_6d(rotation_matrix)
         
@@ -153,8 +155,9 @@ class CELEBAPBR(Dataset):
             "albedo": albedo,
             "roughness": roughness,
             "specular": specular,
-            "depth": depth,
-            "v_coords": v_coords,
+            "depth": norm_depth,
+            "fov": fov,
+            "cam_coords": cam_coords,
             "mask": anno_mask,
             "hdri": hdri,
             "rotation": rotation_6D,
@@ -164,7 +167,7 @@ class CELEBAPBR(Dataset):
         
         return data_buffer
     
-    def get_view_coords(self, depth, width, height, fov):
+    def get_cam_coords(self, depth, width, height, fov):
         fovx = math.radians(fov)
         fovy = 2 * math.atan(math.tan(fovx / 2) / (width / height))
         vpos = torch.zeros(height, width, 3)
@@ -175,10 +178,10 @@ class CELEBAPBR(Dataset):
         Y, X = torch.meshgrid(Y, X, indexing="ij")
         vpos[..., 0] = depth * X * math.tan(fovx / 2)
         vpos[..., 1] = depth * Y * math.tan(fovy / 2)
-        vpos[..., 2] = -depth
+        vpos[..., 2] = depth
         return vpos
 
-def get_dataloader(configs):
+def get_dataloader(configs: Configs):
     
     # Fix random seed
     random_seed = configs.random_seed

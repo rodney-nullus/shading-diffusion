@@ -3,8 +3,12 @@ from dataclasses import dataclass
 
 @dataclass
 class Configs:
+    """
+    Configuration file for stable diffusion VAE training.
+    """
     
     # Experiment settings
+    exp_name: str = "exp_15_unet"
     pretrained_model_name_or_path: str = "sd-legacy/stable-diffusion-v1-5"
     resolution: Union[int, set] = 256
     random_seed: int = 0
@@ -13,28 +17,36 @@ class Configs:
     run_phase: str = "train"                                    # `train`, `inference`
     enable_xformers_memory_efficient_attention: bool = False
     
-    # Model settings
-    ## Diffusion
-    geo_diff_inchns: int = 11
-    geo_diff_outchns: int = 11
+    # Dataloader settings
+    num_workers: int = 4
     
     ## VLM
     max_new_tokens: int = 256
     do_sample: bool = True
     use_cache: bool = True
+    temperature: float = 0.4
+    top_p: float = 0.9
     
-    # Dataloader settings
-    num_workers: int = 4
+    # VAE Model settings
+    vae_from_scratch: bool = False
+    use_tinyae: bool = False
+    freeze_encoder: bool = True
+    encoder_inchns: int = 3
+    freeze_decoder: bool = False
+    decoder_outchns: int = 11
+    scaling_factor: float = None
+    shift_factor: float = None
     
     # Training settings
     train_model: str = ""                                       # `geo-diff`, `tex-diff`
-    train_phase: str = ""                                       # `vae`, `unet`
-    train_batch_size: int = 10
-    learning_rate: float = 1e-4
+    train_phase: str = "unet"                                       # `vae`, `unet`
+    train_batch_size: int = 6
+    learning_rate: float = 5e-5
     scale_lr: bool = False
     lr_warmup_steps: int = 500
+    lr_scheduler: str = "cosine_with_restarts"
     max_train_steps: int = None
-    num_train_epochs: int = 10
+    total_train_epochs: int = 10
     center_crop: bool = False
     random_flip: bool = False
     mixed_precision: str = "no"                                 # `no` for float32, `fp16` for automatic mixed precision
@@ -44,7 +56,6 @@ class Configs:
     prediction_type: str = "epsilon"                            # `epsilon`, `v_prediction`, `sample`
     snr_gamma: float = 5
     max_grad_norm: float = 1.0
-    scale_factor: float = 1.0
     lora_rank: int = 4
     
     use_8bit_adam: bool = False
@@ -55,7 +66,7 @@ class Configs:
     
     use_ema: bool = False
     foreach_ema: bool = False
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
     allow_tf32: bool = True
     scale_lr: bool = False
     

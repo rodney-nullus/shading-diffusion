@@ -9,8 +9,10 @@ class Configs:
     
     # Experiment settings
     exp_name: str = "exp_vae_01"
-    pretrained_model_name_or_path: str = "sd-legacy/stable-diffusion-v1-5"
-    resolution: Union[int, set] = 256
+    # pretrained_model_name_or_path: str = "sd-legacy/stable-diffusion-v1-5"
+    # pretrained_model_name_or_path: str = "lambdalabs/miniSD-diffusers"
+    pretrained_model_name_or_path: str = "wavymulder/portraitplus"
+    resolution: Union[int, set] = 512
     random_seed: int = 0
     load_pretrained_vae: bool = False
     load_pretrained_unet: bool = False
@@ -31,9 +33,7 @@ class Configs:
     shift_factor: float = None
     
     # Training settings
-    train_model: str = ""                                       # `geo-diff`, `tex-diff`
-    train_phase: str = "vae"                                       # `vae`, `unet`
-    train_batch_size: int = 6
+    train_batch_size: int = 10
     learning_rate: float = 5e-5
     scale_lr: bool = False
     lr_warmup_steps: int = 500
@@ -67,7 +67,7 @@ class Configs:
     checkpoints_total_limit: int = 5
     
     # Evaluation settings
-    eval_batch_size: int = 10                                   # how many images to sample during evaluation
+    eval_batch_size: int = 1                                    # how many images to sample during evaluation
     save_model_epochs: int = 1
     validation_prompts: str = ""
     

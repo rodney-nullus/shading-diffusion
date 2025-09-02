@@ -25,7 +25,7 @@ def load_sdr(image_name, resize=False, to_tensor=True):
             rgb_channels = cv.cvtColor(bgr_channels, cv.COLOR_BGR2RGB)
             
             # White Background Image
-            background_image = np.zeros_like(rgb_channels, dtype=np.uint8)
+            background_image = np.ones_like(rgb_channels, dtype=np.uint8)
             
             # Alpha factor
             alpha_factor = alpha_channel[:,:,np.newaxis].astype(np.float32) / 255.
@@ -34,7 +34,7 @@ def load_sdr(image_name, resize=False, to_tensor=True):
             # Transparent Image Rendered on White Background
             base = rgb_channels * alpha_factor
             background = background_image * (1 - alpha_factor)
-            image = base + background
+            image = base + background * 255
         else:
             image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
     

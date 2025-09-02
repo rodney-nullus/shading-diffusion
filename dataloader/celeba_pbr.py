@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
+import torchvision.transforms.functional as tvf
 
 from utils.io import load_sdr, load_hdr
 from utils.graphic_utils import *
@@ -65,7 +66,7 @@ class CELEBAPBR(Dataset):
             self.pose_dict[item.split(" ")[0].split(".")[0].zfill(5)] = item.split(" ")[1:]
 
         # Load prompt data
-        with open(configs.data_dir + "/data_prompt_en.json", "r") as f:
+        with open(configs.data_dir + "/answer_tf.json", "r") as f:
             self.prompt_dict = json.load(f)
     
     def _get_meta_data_list(self):
@@ -114,7 +115,7 @@ class CELEBAPBR(Dataset):
         
         # Camera coordinates normalization
         cam_coords[...,:2] = cam_coords[...,:2] / 80.
-        cam_coords[...,2] = - cam_coords[...,2] / 800.
+        cam_coords[...,2] = cam_coords[...,2] / 800.
         depth_mask = (~(depth == 0)).float().unsqueeze(-1)
         geo_mask_bg = (depth == 0).float().unsqueeze(-1)
         depth = depth.unsqueeze(-1) * depth_mask + geo_mask_bg
@@ -125,29 +126,31 @@ class CELEBAPBR(Dataset):
         norm_depth = ((clipped_depth - self.configs.z_near) / (self.configs.z_far - self.configs.z_near)) * depth_mask
         
         # Load prompts
-        prompt_gt = self.prompt_dict[str(data_index)]
+        prompt = self.prompt_dict.get(str(data_index))
+        if prompt is None:
+            prompt = "0"
         
         # Get yaw, pitch, roll angles
-        pose_gt = torch.tensor([float(item) for item in self.pose_dict[data_index]])
+        pose = torch.tensor([float(item) for item in self.pose_dict[data_index]])
         
         # Compute rotation 6D
-        yaw, pitch, roll = pose_gt
+        yaw, pitch, roll = pose
         # Convert degree to radian
         yaw = yaw / 180 * torch.pi
         pitch = pitch / 180 * torch.pi
         roll = roll / 180 * torch.pi
-        rotation_matrix = torch.zeros(3, 3)
-        rotation_matrix[0, 0] = torch.cos(yaw) * torch.cos(pitch)
-        rotation_matrix[0, 1] = torch.cos(yaw) * torch.sin(pitch) * torch.sin(roll) - torch.sin(yaw) * torch.cos(roll)
-        rotation_matrix[0, 2] = torch.cos(yaw) * torch.sin(pitch) * torch.cos(roll) + torch.sin(yaw) * torch.sin(roll)
-        rotation_matrix[1, 0] = torch.sin(yaw) * torch.cos(pitch)
-        rotation_matrix[1, 1] = torch.sin(yaw) * torch.sin(pitch) * torch.sin(roll) + torch.cos(yaw) * torch.cos(roll)
-        rotation_matrix[1, 2] = torch.sin(yaw) * torch.sin(pitch) * torch.cos(roll) - torch.cos(yaw) * torch.sin(roll)
-        rotation_matrix[2, 0] = -torch.sin(pitch)
-        rotation_matrix[2, 1] = torch.cos(pitch) * torch.sin(roll)
-        rotation_matrix[2, 2] = torch.cos(pitch) * torch.cos(roll)
+        # rotation_matrix = torch.zeros(3, 3)
+        # rotation_matrix[0, 0] = torch.cos(yaw) * torch.cos(pitch)
+        # rotation_matrix[0, 1] = torch.cos(yaw) * torch.sin(pitch) * torch.sin(roll) - torch.sin(yaw) * torch.cos(roll)
+        # rotation_matrix[0, 2] = torch.cos(yaw) * torch.sin(pitch) * torch.cos(roll) + torch.sin(yaw) * torch.sin(roll)
+        # rotation_matrix[1, 0] = torch.sin(yaw) * torch.cos(pitch)
+        # rotation_matrix[1, 1] = torch.sin(yaw) * torch.sin(pitch) * torch.sin(roll) + torch.cos(yaw) * torch.cos(roll)
+        # rotation_matrix[1, 2] = torch.sin(yaw) * torch.sin(pitch) * torch.cos(roll) - torch.cos(yaw) * torch.sin(roll)
+        # rotation_matrix[2, 0] = -torch.sin(pitch)
+        # rotation_matrix[2, 1] = torch.cos(pitch) * torch.sin(roll)
+        # rotation_matrix[2, 2] = torch.cos(pitch) * torch.cos(roll)
         
-        rotation_6D = matrix_to_rotation_6d(rotation_matrix)
+        quaternion = self.euler_to_quaternion(yaw=yaw, pitch=pitch, roll=roll)
         
         data_buffer = {
             "rgb": rgb,
@@ -160,8 +163,8 @@ class CELEBAPBR(Dataset):
             "cam_coords": cam_coords,
             "mask": anno_mask,
             "hdri": hdri,
-            "rotation": rotation_6D,
-            "prompt": prompt_gt,
+            "rotation": quaternion,
+            "prompt": prompt,
             "file_index": str(data_index)
         }
         
@@ -178,9 +181,39 @@ class CELEBAPBR(Dataset):
         Y, X = torch.meshgrid(Y, X, indexing="ij")
         vpos[..., 0] = depth * X * math.tan(fovx / 2)
         vpos[..., 1] = depth * Y * math.tan(fovy / 2)
-        vpos[..., 2] = depth
+        vpos[..., 2] = -depth
         return vpos
+    
+    def euler_to_quaternion(self, yaw, pitch, roll, order="ZYX"):
+        """
+        yaw, pitch, roll: 各自形状都可以是标量或 (B,) 的 tensor，单位：弧度
+        返回：quaternion 四元数 (qw, qx, qy, qz)，形状与输入相同或 (B,4)
+        """
+        # 先保证都是 shape (B,) 方便批处理
+        def _ensure_batch(x):
+            if x.ndim == 0:
+                return x.unsqueeze(0)
+            return x
+        yaw   = _ensure_batch(yaw)
+        pitch = _ensure_batch(pitch)
+        roll  = _ensure_batch(roll)
+        # 计算各自一半角
+        cy = torch.cos(yaw * 0.5)
+        sy = torch.sin(yaw * 0.5)
+        cp = torch.cos(pitch * 0.5)
+        sp = torch.sin(pitch * 0.5)
+        cr = torch.cos(roll * 0.5)
+        sr = torch.sin(roll * 0.5)
 
+        # ZYX 顺序：qw = cz⋅cy⋅cx + sz⋅sy⋅sx …
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+
+        quat = torch.stack([qw, qx, qy, qz], dim=-1)  # (B,4)
+        return quat if quat.shape[0] > 1 else quat[0]  # 标量输入时返回 (4,)
+        
 def get_dataloader(configs: Configs):
     
     # Fix random seed

@@ -1,6 +1,7 @@
 from typing import List
 import torch
 import torch.nn as nn
+from torch.nn.functional import grid_sample
 
 import numpy as np
 
@@ -177,16 +178,19 @@ class FC(nn.Module):
 
 class NeuralShader(nn.Module):
     def __init__(self,
-                 hidden_features_size=256,
+                 hidden_features_size=128,
                  hidden_features_layers=2,
                  activation="relu",
                  last_activation=None,
                  fourier_features="positional",
                  mapping_size=256,
                  fft_scale=8,
+                 num_train_sample=8192,
                  device='cuda'):
         
         super().__init__()
+        
+        self.num_train_sample = num_train_sample
         
         self.fourier_feature_transform = None
         if fourier_features == "positional":
@@ -212,10 +216,59 @@ class NeuralShader(nn.Module):
                            hidden_features=[hidden_features_size // 2] * hidden_features_layers, 
                            activation=activation, 
                            last_activation=last_activation)
+        
+        # BRDF Network
+        self.brdf = FC(in_features=channels, 
+                       out_features=hidden_features_size, 
+                       hidden_features=[hidden_features_size] * hidden_features_layers, 
+                       activation=activation, 
+                       last_activation=None)
     
-    def forward(self, normal, albedo, roughness, specular, in_dirs, out_dirs, hdri_samples):
+    def forward(self, normal, albedo, roughness, specular, mask, in_dirs, out_dirs, hdri_samples, inference):
         
         with torch.no_grad():
+            
+            # # 2) Build screen uv grid
+            # ys = torch.linspace(0.0, 1.0, steps=self.height, device=self.device)
+            # xs = torch.linspace(0.0, 1.0, steps=self.width, device=self.device)
+            # v, u = torch.meshgrid(ys, xs, indexing='ij')
+            # uv_hw = torch.stack([u, v], dim=-1)  # [H, W, 2]
+            # uv_batch = uv_hw.unsqueeze(0).expand(B, -1, -1, -1)  #[B,H,W,2]
+            
+            # # 3) Sample brdf feature
+            # grid = uv_batch * 2.0 - 1.0  # Scale to [-1,1]
+            # # grid = grid.reshape(1, 1, self.height*self.width, 2)        # [1,1,N,2]
+            # sampled = grid_sample(latent, grid, align_corners=True)
+            # masked_sample = sampled
+            # brdf_codes = sampled.squeeze(0).squeeze(1).transpose(0,1)        # [N, C]
+            
+            if not inference:
+                num_all_training_pixels = normal[mask].shape[0]
+                if self.num_train_sample < num_all_training_pixels:
+                    num_train_sample = self.num_train_sample
+                else:
+                    num_train_sample = num_all_training_pixels
+                
+                rand_indices = torch.randperm(num_all_training_pixels, device=albedo.device)[:num_train_sample]
+                
+                in_dirs = in_dirs[:,:,None,None,:].repeat(1,1,normal.shape[2],normal.shape[1],1).permute(0,2,3,1,4)[mask][rand_indices]
+                hdri_samples = hdri_samples[:,:,None,None,:].repeat(1,1,normal.shape[2],normal.shape[1],1).permute(0,2,3,1,4)[mask][rand_indices]
+                normal = normal[mask][rand_indices].unsqueeze(1).broadcast_to(*in_dirs.shape[:-1],3)
+                albedo = albedo[mask][rand_indices].unsqueeze(1).broadcast_to(*in_dirs.shape[:-1],3)
+                roughness = roughness[mask][rand_indices].unsqueeze(1)[...,None].broadcast_to(*in_dirs.shape[:-1],1)
+                specular = specular[mask][rand_indices].unsqueeze(1)[...,None].broadcast_to(*in_dirs.shape[:-1],1)
+                out_dirs = out_dirs[mask][rand_indices].unsqueeze(1).broadcast_to(*in_dirs.shape[:-1],3)
+            else:
+                in_dirs = in_dirs[:,:,None,None,:].repeat(1,1,normal.shape[2],normal.shape[1],1).permute(0,2,3,1,4)[mask]
+                hdri_samples = hdri_samples[:,:,None,None,:].repeat(1,1,normal.shape[2],normal.shape[1],1).permute(0,2,3,1,4)[mask]
+                normal = normal[mask].unsqueeze(1).broadcast_to(*in_dirs.shape[:-1],3)
+                albedo = albedo[mask].unsqueeze(1).broadcast_to(*in_dirs.shape[:-1],3)
+                roughness = roughness[mask].unsqueeze(1)[...,None].broadcast_to(*in_dirs.shape[:-1],1)
+                specular = specular[mask].unsqueeze(1)[...,None].broadcast_to(*in_dirs.shape[:-1],1)
+                out_dirs = out_dirs[mask].unsqueeze(1).broadcast_to(*in_dirs.shape[:-1],3)
+                
+                rand_indices = None
+            
             g_buffer = torch.cat([albedo, roughness, specular, normal], dim=-1)                                             # [S,N,8]
             
             half_dirs = in_dirs + out_dirs                                                                                  # [S,N,3]
@@ -236,4 +289,4 @@ class NeuralShader(nn.Module):
         # Calculate intergal for all incident directions
         color = color.mean(dim=1)
 
-        return color.clamp(min=0.,max=1.)
+        return color.clamp(min=0.,max=1.), rand_indices

@@ -39,7 +39,7 @@ def build_envmap_cdf(envmap):
         cdf_marg / cdf_marg[:,-1].unsqueeze(-1)
     ], dim=1)                                   # [B,H+1]
 
-    return cdf_marg, cdf_cond
+    return cdf_marg, cdf_cond, weighted
 
 def sample_envmap_direction(cdf_marg, cdf_cond, num_samples=1):
     """
@@ -60,7 +60,7 @@ def sample_envmap_direction(cdf_marg, cdf_cond, num_samples=1):
 
     # 1. Sample row indices via inverse transform
     u_m = torch.rand((B,num_samples), device=cdf_marg.device)  # uniform [0,1)
-    rows = torch.searchsorted(cdf_marg, u_m, right=False).clamp(min=0,max=H) - 1  # [num_samples]
+    rows = torch.searchsorted(cdf_marg, u_m, right=False).clamp(min=0,max=H-1)  # [num_samples]
     cdf_m0 = cdf_marg.gather(1, rows)
     cdf_m1 = cdf_marg.gather(1, rows + 1)
     
@@ -71,7 +71,7 @@ def sample_envmap_direction(cdf_marg, cdf_cond, num_samples=1):
     cdf_rows = cdf_cond[batch_idx, rows]                                # [B, N, W+1]
     u_c = torch.rand((B,num_samples), device=cdf_marg.device)
     # Vectorized searchsorted for each row
-    cols = torch.searchsorted(cdf_rows, u_c.unsqueeze(-1), right=False).clamp(min=0,max=W) - 1
+    cols = torch.searchsorted(cdf_rows, u_c.unsqueeze(-1), right=False).clamp(min=0,max=W-1)
     cols = cols.squeeze(-1)
     
     cdf_c0 = torch.gather(cdf_rows, 2, cols.unsqueeze(-1)).squeeze(-1)          # [B, N]

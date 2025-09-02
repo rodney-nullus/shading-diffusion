@@ -11,6 +11,7 @@ from diffusers.models.unets.unet_2d_blocks import (
     UNetMidBlock2D,
     get_up_block
 )
+from diffusers.utils import BaseOutput, is_torch_version
 
 from .positional_embedder import get_embedder
 from .gfft import GaussianFourierFeatureTransform
@@ -38,41 +39,33 @@ class NeuralShader(nn.Module):
         self.height = height
         self.device = device
         
-        # self.fourier_feature_transform = None
-        # if fourier_features == "positional":
-        #     self.fourier_feature_transform, channels = get_embedder(fft_scale, 11)
-        # elif fourier_features == "gfft":
-        #     self.fourier_feature_transform = GaussianFourierFeatureTransform(11, mapping_size=mapping_size//2, scale=fft_scale, device=device)
-        #     channels = mapping_size
-        # elif fourier_features == "none":
-        #     pass
-        # else:
-        #     raise "Invalid fourier features setting. Shoud be one of 'positional', 'gfft', 'none'."
+        self.fourier_feature_transform = None
+        if fourier_features == "positional":
+            self.fourier_feature_transform, channels = get_embedder(fft_scale, 11)
+        elif fourier_features == "gfft":
+            self.fourier_feature_transform = GaussianFourierFeatureTransform(11, mapping_size=mapping_size//2, scale=fft_scale, device=device)
+            channels = mapping_size
+        elif fourier_features == "none":
+            pass
+        else:
+            raise "Invalid fourier features setting. Shoud be one of 'positional', 'gfft', 'none'."
                 
         # Diffuse Network
-        self.brdf_net = FC(in_features=8, 
-                           out_features=3, 
+        self.diffuse_net = FC(in_features=channels, 
+                           out_features=hidden_features_size, 
                            hidden_features=[hidden_features_size] * hidden_features_layers, 
                            activation=activation, 
                            last_activation=None)
         
+        # Specular Network
+        self.specular = FC(in_features=hidden_features_size + 7, 
+                           out_features=3, 
+                           hidden_features=[hidden_features_size // 2] * hidden_features_layers, 
+                           activation=activation, 
+                           last_activation=last_activation)
+        
         cam_pos = torch.tensor([0., 0., 0.])[None,None,:]
         self.cam_pos = nn.Parameter(cam_pos, requires_grad=False)
-    
-    def get_cam_coords(self, depth, width, height, fov):
-        fov = torch.tensor(fov, device=depth.device)[None].repeat(depth.shape[0])
-        fovx = torch.deg2rad(fov)
-        fovy = 2 * torch.atan(torch.tan(fovx / 2) / (width / height))
-        cam_pos = torch.zeros(depth.shape[0], height, width, 3, device=depth.device)
-        Y = 1 - (torch.arange(height, device=depth.device) + 0.5) / height
-        Y = Y * 2 - 1
-        X = (torch.arange(width, device=depth.device) + 0.5) / width
-        X = X * 2 - 1
-        Y, X = torch.meshgrid(Y, X, indexing="ij")
-        cam_pos[..., 0] = depth.squeeze() * X[None,:,:] * torch.tan(fovx[:,None,None] / 2)
-        cam_pos[..., 1] = depth.squeeze() * Y[None,:,:] * torch.tan(fovy[:,None,None] / 2)
-        cam_pos[..., 2] = depth.squeeze()
-        return cam_pos
     
     def forward(self, depth_map, fov, mat_map, normal_map, mask, env_map, spp=128):
         
@@ -82,7 +75,7 @@ class NeuralShader(nn.Module):
             
             # 1) Importance sampling
             # Build CDFs
-            cdf_marg, cdf_cond = build_envmap_cdf(env_map)
+            cdf_marg, cdf_cond, _ = build_envmap_cdf(env_map)
             
             # Draw inbound light samples
             w_i, uv = sample_envmap_direction(cdf_marg, cdf_cond, num_samples=spp)
@@ -130,24 +123,202 @@ class NeuralShader(nn.Module):
             
             L = (L_e[:,:,None,None,:] * n_d_i).sum(dim=1) / spp
             masked_L = L[mask.bool()]
-            
-            # if self.fourier_feature_transform is not None:
-            #     diffuse_shading_input = self.fourier_feature_transform(diffuse_shading_input)
         
             masked_mat_sample = mat_map.permute(0,2,3,1)[mask.bool()]
             masked_w_o = w_o.squeeze(1)[mask.bool()]
             
-            brdf_input = torch.cat([masked_mat_sample, masked_w_o], dim=-1)
+            shading_input = torch.cat([masked_mat_sample, masked_w_o], dim=-1)
+            
+            if self.fourier_feature_transform is not None:
+                diffuse_shading_input = self.fourier_feature_transform(shading_input)
         
-        brdf = self.brdf_net(brdf_input)
+        brdf = self.brdf_net(diffuse_shading_input)
         color = brdf * masked_L
         
         shading_rgb = torch.zeros(B, H, W, 3, device=self.device)
         shading_rgb[mask.bool()] = color.clamp(min=0.,max=1.)
 
         return shading_rgb
+    
+    def get_cam_coords(self, depth, width, height, fov):
+        fov = torch.tensor(fov, device=depth.device)[None].repeat(depth.shape[0])
+        fovx = torch.deg2rad(fov)
+        fovy = 2 * torch.atan(torch.tan(fovx / 2) / (width / height))
+        cam_pos = torch.zeros(depth.shape[0], height, width, 3, device=depth.device)
+        Y = 1 - (torch.arange(height, device=depth.device) + 0.5) / height
+        Y = Y * 2 - 1
+        X = (torch.arange(width, device=depth.device) + 0.5) / width
+        X = X * 2 - 1
+        Y, X = torch.meshgrid(Y, X, indexing="ij")
+        cam_pos[..., 0] = depth.squeeze() * X[None,:,:] * torch.tan(fovx[:,None,None] / 2)
+        cam_pos[..., 1] = depth.squeeze() * Y[None,:,:] * torch.tan(fovy[:,None,None] / 2)
+        cam_pos[..., 2] = depth.squeeze()
+        return cam_pos
 
-class ShadingDecoder(nn.Module):
+# class Decoder(nn.Module):
+#     r"""
+#     The `Decoder` layer of a variational autoencoder that decodes its latent representation into an output sample.
+
+#     Args:
+#         in_channels (`int`, *optional*, defaults to 3):
+#             The number of input channels.
+#         out_channels (`int`, *optional*, defaults to 3):
+#             The number of output channels.
+#         up_block_types (`Tuple[str, ...]`, *optional*, defaults to `("UpDecoderBlock2D",)`):
+#             The types of up blocks to use. See `~diffusers.models.unet_2d_blocks.get_up_block` for available options.
+#         block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
+#             The number of output channels for each block.
+#         layers_per_block (`int`, *optional*, defaults to 2):
+#             The number of layers per block.
+#         norm_num_groups (`int`, *optional*, defaults to 32):
+#             The number of groups for normalization.
+#         act_fn (`str`, *optional*, defaults to `"silu"`):
+#             The activation function to use. See `~diffusers.models.activations.get_activation` for available options.
+#         norm_type (`str`, *optional*, defaults to `"group"`):
+#             The normalization type to use. Can be either `"group"` or `"spatial"`.
+#     """
+
+#     def __init__(
+#         self,
+#         in_channels: int = 3,
+#         out_channels: int = 3,
+#         up_block_types: Tuple[str, ...] = ("UpDecoderBlock2D",),
+#         block_out_channels: Tuple[int, ...] = (64,),
+#         layers_per_block: int = 2,
+#         norm_num_groups: int = 32,
+#         act_fn: str = "silu",
+#         norm_type: str = "group",  # group, spatial
+#         mid_block_add_attention=True,
+#     ):
+#         super().__init__()
+#         self.layers_per_block = layers_per_block
+
+#         self.conv_in = nn.Conv2d(
+#             in_channels,
+#             block_out_channels[-1],
+#             kernel_size=3,
+#             stride=1,
+#             padding=1,
+#         )
+
+#         self.geo_up_blocks = nn.ModuleList([])
+#         self.mat_up_blocks = nn.ModuleList([])
+
+#         temb_channels = in_channels if norm_type == "spatial" else None
+
+#         # mid
+#         self.mid_block = UNetMidBlock2D(
+#             in_channels=block_out_channels[-1],
+#             resnet_eps=1e-6,
+#             resnet_act_fn=act_fn,
+#             output_scale_factor=1,
+#             resnet_time_scale_shift="default" if norm_type == "group" else norm_type,
+#             attention_head_dim=block_out_channels[-1],
+#             resnet_groups=norm_num_groups,
+#             temb_channels=temb_channels,
+#             add_attention=mid_block_add_attention,
+#         )
+
+#         # up
+#         reversed_block_out_channels = list(reversed(block_out_channels))
+#         output_channel = reversed_block_out_channels[0]
+#         for i, up_block_type in enumerate(up_block_types):
+#             prev_output_channel = output_channel
+#             output_channel = reversed_block_out_channels[i]
+
+#             is_final_block = i == len(block_out_channels) - 1
+
+#             geo_up_block = get_up_block(
+#                 up_block_type,
+#                 num_layers=self.layers_per_block + 1,
+#                 in_channels=prev_output_channel,
+#                 out_channels=output_channel,
+#                 prev_output_channel=prev_output_channel,
+#                 add_upsample=not is_final_block,
+#                 resnet_eps=1e-6,
+#                 resnet_act_fn=act_fn,
+#                 resnet_groups=norm_num_groups,
+#                 attention_head_dim=output_channel,
+#                 temb_channels=temb_channels,
+#                 resnet_time_scale_shift=norm_type,
+#             )
+            
+#             mat_up_block = copy.deepcopy(geo_up_block)
+            
+#             self.geo_up_blocks.append(geo_up_block)
+#             self.mat_up_blocks.append(mat_up_block)
+#             prev_output_channel = output_channel
+
+#         # out
+#         if norm_type == "spatial":
+#             self.conv_norm_out = SpatialNorm(block_out_channels[0], temb_channels)
+#         else:
+#             self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
+#         self.conv_act = nn.SiLU()
+        
+#         self.geo_conv_out = nn.Conv2d(block_out_channels[0], 8, 3, padding=1)
+#         self.mat_conv_out = nn.Conv2d(block_out_channels[0], 5, 3, padding=1)
+
+#         self.gradient_checkpointing = False
+
+#     def forward(
+#         self,
+#         sample: torch.Tensor,
+#         latent_embeds: Optional[torch.Tensor] = None
+#     ) -> torch.Tensor:
+#         r"""The forward method of the `Decoder` class."""
+
+#         sample = self.conv_in(sample)
+
+#         geo_upscale_dtype = next(iter(self.geo_up_blocks.parameters())).dtype
+#         mat_upscale_dtype = next(iter(self.mat_up_blocks.parameters())).dtype
+#         if torch.is_grad_enabled() and self.gradient_checkpointing:
+#             # middle
+#             sample = self._gradient_checkpointing_func(self.mid_block, sample, latent_embeds)
+#             geo_sample = sample.to(geo_upscale_dtype)
+#             mat_sample = sample.to(mat_upscale_dtype)
+
+#             # up
+#             for up_block in self.geo_up_blocks:
+#                 geo_sample = up_block(geo_sample, latent_embeds)
+            
+#             up_mat_feature_list = []
+#             for up_block in self.mat_up_blocks:
+#                 up_mat_feature_list.append(mat_sample)
+#                 mat_sample = up_block(mat_sample, latent_embeds)
+#         else:
+#             # middle
+#             sample = self.mid_block(sample, latent_embeds)
+#             geo_sample = sample.to(geo_upscale_dtype)
+#             mat_sample = sample.to(mat_upscale_dtype)
+
+#             # up
+#             for up_block in self.geo_up_blocks:
+#                 geo_sample = up_block(geo_sample, latent_embeds)
+            
+#             up_mat_feature_list = []
+#             for up_block in self.mat_up_blocks:
+#                 up_mat_feature_list.append(mat_sample)
+#                 mat_sample = up_block(mat_sample, latent_embeds)
+        
+#         # post-process
+#         if latent_embeds is None:
+#             geo_sample = self.conv_norm_out(geo_sample)
+#         else:
+#             geo_sample = self.conv_norm_out(geo_sample, latent_embeds)
+#         geo_sample = self.conv_act(geo_sample)
+#         geo_sample = self.geo_conv_out(geo_sample)
+        
+#         if latent_embeds is None:
+#             mat_sample = self.conv_norm_out(mat_sample)
+#         else:
+#             mat_sample = self.conv_norm_out(mat_sample, latent_embeds)
+#         mat_sample = self.conv_act(mat_sample)
+#         mat_sample = self.mat_conv_out(mat_sample)
+        
+#         return (geo_sample, mat_sample, up_mat_feature_list)
+
+class Decoder(nn.Module):
     r"""
     The `Decoder` layer of a variational autoencoder that decodes its latent representation into an output sample.
 
@@ -193,8 +364,8 @@ class ShadingDecoder(nn.Module):
             padding=1,
         )
 
-        self.geo_up_blocks = nn.ModuleList([])
-        self.mat_up_blocks = nn.ModuleList([])
+        self.mid_block = None
+        self.up_blocks = nn.ModuleList([])
 
         temb_channels = in_channels if norm_type == "spatial" else None
 
@@ -220,12 +391,12 @@ class ShadingDecoder(nn.Module):
 
             is_final_block = i == len(block_out_channels) - 1
 
-            geo_up_block = get_up_block(
+            up_block = get_up_block(
                 up_block_type,
                 num_layers=self.layers_per_block + 1,
                 in_channels=prev_output_channel,
                 out_channels=output_channel,
-                prev_output_channel=prev_output_channel,
+                prev_output_channel=None,
                 add_upsample=not is_final_block,
                 resnet_eps=1e-6,
                 resnet_act_fn=act_fn,
@@ -234,11 +405,7 @@ class ShadingDecoder(nn.Module):
                 temb_channels=temb_channels,
                 resnet_time_scale_shift=norm_type,
             )
-            
-            mat_up_block = copy.deepcopy(geo_up_block)
-            
-            self.geo_up_blocks.append(geo_up_block)
-            self.mat_up_blocks.append(mat_up_block)
+            self.up_blocks.append(up_block)
             prev_output_channel = output_channel
 
         # out
@@ -247,68 +414,78 @@ class ShadingDecoder(nn.Module):
         else:
             self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
-        
-        self.geo_conv_out = nn.Conv2d(block_out_channels[0], 8, 3, padding=1)
-        self.mat_conv_out = nn.Conv2d(block_out_channels[0], 5, 3, padding=1)
+        self.conv_out = nn.Conv2d(block_out_channels[0], 3, 3, padding=1)
+        self.gbuf_conv_out = nn.Conv2d(block_out_channels[0], 10, 3, padding=1)
 
         self.gradient_checkpointing = False
 
     def forward(
         self,
-        sample: torch.Tensor,
-        latent_embeds: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        sample: torch.FloatTensor,
+        latent_embeds: Optional[torch.FloatTensor] = None,
+    ) -> torch.FloatTensor:
         r"""The forward method of the `Decoder` class."""
 
         sample = self.conv_in(sample)
 
-        geo_upscale_dtype = next(iter(self.geo_up_blocks.parameters())).dtype
-        mat_upscale_dtype = next(iter(self.mat_up_blocks.parameters())).dtype
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            # middle
-            sample = self._gradient_checkpointing_func(self.mid_block, sample, latent_embeds)
-            geo_sample = sample.to(geo_upscale_dtype)
-            mat_sample = sample.to(mat_upscale_dtype)
+        upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
+        if self.training and self.gradient_checkpointing:
 
-            # up
-            for up_block in self.geo_up_blocks:
-                geo_sample = up_block(geo_sample, latent_embeds)
-            
-            up_mat_feature_list = []
-            for up_block in self.mat_up_blocks:
-                up_mat_feature_list.append(mat_sample)
-                mat_sample = up_block(mat_sample, latent_embeds)
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+
+                return custom_forward
+
+            if is_torch_version(">=", "1.11.0"):
+                # middle
+                sample = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(self.mid_block),
+                    sample,
+                    latent_embeds,
+                    use_reentrant=False,
+                )
+                sample = sample.to(upscale_dtype)
+
+                # up
+                for up_block in self.up_blocks:
+                    sample = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(up_block),
+                        sample,
+                        latent_embeds,
+                        use_reentrant=False,
+                    )
+            else:
+                # middle
+                sample = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(self.mid_block), sample, latent_embeds
+                )
+                sample = sample.to(upscale_dtype)
+
+                # up
+                for up_block in self.up_blocks:
+                    sample = torch.utils.checkpoint.checkpoint(create_custom_forward(up_block), sample, latent_embeds)
         else:
             # middle
             sample = self.mid_block(sample, latent_embeds)
-            geo_sample = sample.to(geo_upscale_dtype)
-            mat_sample = sample.to(mat_upscale_dtype)
+            sample = sample.to(upscale_dtype)
 
             # up
-            for up_block in self.geo_up_blocks:
-                geo_sample = up_block(geo_sample, latent_embeds)
-            
-            up_mat_feature_list = []
-            for up_block in self.mat_up_blocks:
-                up_mat_feature_list.append(mat_sample)
-                mat_sample = up_block(mat_sample, latent_embeds)
+            for up_block in self.up_blocks:
+                sample = up_block(sample, latent_embeds)
         
+        feature_sample = sample
+
         # post-process
         if latent_embeds is None:
-            geo_sample = self.conv_norm_out(geo_sample)
+            sample = self.conv_norm_out(sample)
         else:
-            geo_sample = self.conv_norm_out(geo_sample, latent_embeds)
-        geo_sample = self.conv_act(geo_sample)
-        geo_sample = self.geo_conv_out(geo_sample)
-        
-        if latent_embeds is None:
-            mat_sample = self.conv_norm_out(mat_sample)
-        else:
-            mat_sample = self.conv_norm_out(mat_sample, latent_embeds)
-        mat_sample = self.conv_act(mat_sample)
-        mat_sample = self.mat_conv_out(mat_sample)
-        
-        return geo_sample, mat_sample, up_mat_feature_list
+            sample = self.conv_norm_out(sample, latent_embeds)
+        sample = self.conv_act(sample)
+        rgb_sample = self.conv_out(sample)
+        gbuf_sample = self.gbuf_conv_out(sample)
+
+        return rgb_sample, gbuf_sample, feature_sample
 
 class VAE(nn.Module):
     def __init__(self, configs: Configs):
@@ -323,13 +500,12 @@ class VAE(nn.Module):
         vae.enable_xformers_memory_efficient_attention()
         
         # Change the number of input channels of vae encoder
-        conv_in_out_chns = vae.encoder.conv_in.out_channels
-        vae.encoder.conv_in = nn.Conv2d(13, conv_in_out_chns, kernel_size=3, stride=1, padding=1)
-        # vae.encoder.requires_grad_(False)
+        # conv_in_out_chns = vae.encoder.conv_in.out_channels
+        # vae.encoder.conv_in = nn.Conv2d(13, conv_in_out_chns, kernel_size=3, stride=1, padding=1)
         
         pretrained_vae_config = vae.config
         
-        shading_decoder: ShadingDecoder = ShadingDecoder(
+        shading_decoder: Decoder = Decoder(
             in_channels = pretrained_vae_config.latent_channels,
             out_channels = pretrained_vae_config.out_channels,
             up_block_types = pretrained_vae_config.up_block_types,
@@ -346,11 +522,6 @@ class VAE(nn.Module):
         filtered_sd = {k: orig_decoder_sd[k].clone() for k in shared_keys}
         shading_decoder.load_state_dict(filtered_sd, strict=False)
         
-        up_blocks_copy = copy.deepcopy(vae.decoder.up_blocks)
-        up_blocks_sd = up_blocks_copy.state_dict()
-        shading_decoder.geo_up_blocks.load_state_dict(up_blocks_sd)
-        shading_decoder.mat_up_blocks.load_state_dict(up_blocks_sd)
-        
         # Replace pretrained 
         vae.decoder = shading_decoder
         
@@ -364,10 +535,38 @@ class VAE(nn.Module):
         self.vae = vae
     
     def forward(self, input):
-        
         posterior = self.vae.encode(input).latent_dist
         latents = posterior.sample()
-        geo_output, mat_output, mat_feature_list = self.vae.decoder(latents)
+        geo_output, mat_output, mat_feature_list = self.vae.decode(latents).sample
         kl_loss = posterior.kl().mean()
+        
+        geo_output = geo_output * 0.5 + 0.5
+        mat_output = mat_output * 0.5 + 0.5
+        
+        # rgb_pred = geo_output[:,:3].clamp(0,1)
+        # depth_pred = geo_output[:,3].unsqueeze(1).clamp(0,1)
+        # normal_pred = geo_output[:,4:7].clamp(0,1)
+        # mask_pred = geo_output[:,7].unsqueeze(1).clamp(0,1)
+        # albedo_pred = mat_output[:,:3].clamp(0,1)
+        # roughness_pred = mat_output[:,3].unsqueeze(1).clamp(0,1)
+        # specular_pred = mat_output[:,4].unsqueeze(1).clamp(0,1)
+        
+        rgb_pred = geo_output.clamp(0,1)
+        depth_pred = mat_output[:,0].unsqueeze(1).clamp(0,1)
+        normal_pred = mat_output[:,1:4].clamp(0,1)
+        mask_pred = mat_output[:,4].unsqueeze(1).clamp(0,1)
+        albedo_pred = mat_output[:,5:8].clamp(0,1)
+        roughness_pred = mat_output[:,8].unsqueeze(1).clamp(0,1)
+        specular_pred = mat_output[:,9].unsqueeze(1).clamp(0,1)
             
-        return geo_output.clamp(0,1), mat_output.clamp(0,1), mat_feature_list, kl_loss
+        return (
+            rgb_pred,
+            depth_pred,
+            normal_pred,
+            mask_pred,
+            albedo_pred,
+            roughness_pred,
+            specular_pred,
+            kl_loss,
+            mat_feature_list
+        )

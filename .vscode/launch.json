@@ -4,6 +4,7 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+    
         {
             "name": "Preprocessor",
             "type": "debugpy",
@@ -33,7 +34,7 @@
             "console": "integratedTerminal",
             "args": [
                 "exp_debug",
-                "--train_phase", "ns"
+                "--train_phase", "vae"
                 // "--resume_from_checkpoint", "latest"
             ]
         },
@@ -92,13 +93,18 @@
             ]
         },
         {
-            "name": "vea_pipeline",
+            "name": "Evaluation",
             "type": "debugpy",
             "request": "launch",
-            "program": "inference/vae_pipeline.py",
-            "cwd": "${workspaceFolder}",
+            "program": "evaluation.py",
+            "cwd": "${workspaceFolder}/evaluation",
             "console": "integratedTerminal",
             "args": [
+                "eval_debug",
+                "--eval_type", "text2image",
+                "--eval_model", "sd15",
+                "--render_model", "ns",
+                "--dataset", "ffhq"
             ]
         }
     ]

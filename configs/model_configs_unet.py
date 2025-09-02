@@ -31,8 +31,8 @@ class UNETConfigs:
     # Training settings
     train_model: str = ""                                       # `geo-diff`, `tex-diff`
     train_phase: str = ""                                       # `vae`, `unet`
-    train_batch_size: int = 10
-    learning_rate: float = 1e-4
+    train_batch_size: int = 6
+    learning_rate: float = 5e-5
     lr_scheduler: str = "cosine"                                # `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `constant`, `constant_with_warmup`
     scale_lr: bool = False
     lr_warmup_steps: int = 500
@@ -70,7 +70,7 @@ class UNETConfigs:
     checkpoints_total_limit: int = 5
     
     # Evaluation settings
-    eval_batch_size: int = 10                                   # how many images to sample during evaluation
+    eval_batch_size: int = 1                                    # how many images to sample during evaluation
     save_model_epochs: int = 1
     validation_prompts: str = ""
     

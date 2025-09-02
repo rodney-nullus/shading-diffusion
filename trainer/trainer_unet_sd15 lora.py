@@ -46,8 +46,8 @@ class Trainer:
         # self.scaling_factor = 1.0076718898718957
         # self.shift_mean = torch.tensor([-0.0042, -0.0069,  0.0035, -0.0018])
         
-        # self.scaling_factor = torch.load("scaling_factor.pth")
-        # self.shift_factor = torch.load("shifting_factor.pth")
+        self.scaling_factor = torch.load("scaling_factor.pth")
+        self.shift_factor = torch.load("shifting_factor.pth")
         
         if isinstance(configs.resolution, set):
             self.width, self.height = configs.resolution
@@ -141,7 +141,7 @@ class Trainer:
         self.total_train_steps = self.total_train_epochs * self.num_update_steps_per_epoch
         self.total_batch_size = configs.train_batch_size * self.accelerator.num_processes * configs.gradient_accumulation_steps
         
-        # vae_shader: VAE = VAE(configs=configs)
+        vae_shader: VAE = VAE(configs=configs)
         neural_renderer: NeuralRenderer = NeuralRenderer()
         
         # Pose encoder
@@ -173,23 +173,20 @@ class Trainer:
         )
         
         # Add new token to tokenizer
-        # new_tokens = ["[POSE]"]
-        # self.tokenizer.add_tokens(new_tokens)
-        # self.pose_token_id = self.tokenizer.convert_tokens_to_ids("[POSE]")
+        new_tokens = ["[POSE]"]
+        self.tokenizer.add_tokens(new_tokens)
+        self.pose_token_id = self.tokenizer.convert_tokens_to_ids("[POSE]")
         
         # Load text_encoder
         text_encoder = CLIPTextModel.from_pretrained(
             configs.pretrained_model_name_or_path, 
             subfolder="text_encoder"
         )
-        # text_encoder.resize_token_embeddings(len(self.tokenizer))
-        # self.token_embedding = text_encoder.get_input_embeddings()
+        text_encoder.resize_token_embeddings(len(self.tokenizer))
+        self.token_embedding = text_encoder.get_input_embeddings()
         
         # Load noise scheduler
         self.noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(configs.pretrained_model_name_or_path, subfolder="scheduler")
-        
-        # Load vae
-        vae: AutoencoderKL = AutoencoderKL.from_pretrained(configs.pretrained_model_name_or_path, subfolder="vae")
         
         # Load unet model
         unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(configs.pretrained_model_name_or_path, subfolder="unet")
@@ -212,7 +209,6 @@ class Trainer:
                 self.ema_unet = ema_unet.to(self.device)
         
         # Freeze parameters of models to save more memory
-        vae.requires_grad_(False)
         unet.requires_grad_(False)
         text_encoder.requires_grad_(False)
         
@@ -226,15 +222,15 @@ class Trainer:
                     param.requires_grad = True
         
         # Fix vae, ns parameters
-        # for name, params in vae_shader.named_parameters():
-        #     params.requires_grad = False
+        for name, params in vae_shader.named_parameters():
+            params.requires_grad = False
         
         for name, params in neural_renderer.named_parameters():
             params.requires_grad = False
         
         # Move unet, vae and text_encoder to device and cast to weight_dtype
         unet.to(self.accelerator.device, dtype=self.weight_dtype)
-        vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        vae_shader.to(self.accelerator.device, dtype=self.weight_dtype)
         text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
         pose_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
         
@@ -256,7 +252,7 @@ class Trainer:
         self.pipeline = StableDiffusionPipeline.from_pretrained(
             self.configs.pretrained_model_name_or_path,
             text_encoder=text_encoder,
-            vae=vae,
+            vae=vae_shader.vae,
             unet=unet
         ).to(self.device)
         self.pipeline.torch_dtype = self.weight_dtype
@@ -268,7 +264,7 @@ class Trainer:
             self.generator = torch.Generator(device=self.device).manual_seed(self.configs.random_seed)
         
         # Initialize the optimizer
-        self.trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters())) #+ list(pose_encoder.parameters())
+        self.trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters())) + list(pose_encoder.parameters())
 
         optimizer = torch.optim.AdamW(
             params=self.trainable_params,
@@ -300,7 +296,7 @@ class Trainer:
         # Prepare everything
         # There is no specific order to remember, you just need to unpack the
         # objects in the same order you gave them to the prepare method.
-        (self.vae,
+        (self.vae_shader,
          self.neural_renderer,
          self.pose_encoder,
          self.unet, 
@@ -309,22 +305,22 @@ class Trainer:
          self.lr_scheduler, 
          self.train_loader, 
          self.eval_loader) = self.accelerator.prepare(
-            vae, neural_renderer, pose_encoder, unet, text_encoder, optimizer, lr_scheduler, train_loader, eval_loader)
+            vae_shader, neural_renderer, pose_encoder, unet, text_encoder, optimizer, lr_scheduler, train_loader, eval_loader)
         
-        # # Load pretrained weights from vae phase
-        # dirs = os.listdir(self.project_dir)
-        # vae_dirs = [d for d in dirs if d.startswith(f"vae")]
-        # vae_path = vae_dirs[-1] if len(vae_dirs) > 0 else None
-        # ns_dirs = [d for d in dirs if d.startswith(f"ns")]
-        # ns_path = ns_dirs[-1] if len(ns_dirs) > 0 else None
+        # Load pretrained weights from vae phase
+        dirs = os.listdir(self.project_dir)
+        vae_dirs = [d for d in dirs if d.startswith(f"vae")]
+        vae_path = vae_dirs[-1] if len(vae_dirs) > 0 else None
+        ns_dirs = [d for d in dirs if d.startswith(f"ns")]
+        ns_path = ns_dirs[-1] if len(ns_dirs) > 0 else None
         
-        # if vae_path is None:
-        #     raise RuntimeError("Pretrained weights does not exist.")
-        # else:
-        #     vae_weights = torch.load(f"{self.project_dir}/vae.pth")
-        #     self.vae.load_state_dict(vae_weights)
-        #     # ns_weights = torch.load(f"{self.project_dir}/ns.pth")
-        #     # self.neural_renderer.load_state_dict(ns_weights)
+        if vae_path is None or ns_path is None:
+            raise RuntimeError("Pretrained weights does not exist.")
+        else:
+            vae_weights = torch.load(f"{self.project_dir}/vae.pth")
+            self.vae_shader.load_state_dict(vae_weights)
+            # ns_weights = torch.load(f"{self.project_dir}/ns.pth")
+            # self.neural_renderer.load_state_dict(ns_weights)
         
         # Initialize Compel
         self.compel = Compel(tokenizer=self.tokenizer, text_encoder=self.text_encoder)
@@ -343,8 +339,8 @@ class Trainer:
         
         # Initial log
         self.logger.info("***** Running training *****")
-        self.logger.info(f"  Training backbone: {self.configs.pretrained_model_name_or_path}")
         self.logger.info(f"  Num examples = {len(self.train_loader)}")
+        
         self.logger.info(f"  Num Epochs = {self.total_train_epochs}")
         self.logger.info(f"  Instantaneous batch size per device = {self.configs.train_batch_size}")
         self.logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {self.total_batch_size}")
@@ -419,7 +415,7 @@ class Trainer:
         
         # Train loop for unet
         self.unet.train()
-        # self.pose_encoder.train()
+        self.pose_encoder.train()
         train_loss = 0.0
         progress_bar = tqdm(
             range(self.initial_step, len(self.train_loader)),
@@ -433,38 +429,37 @@ class Trainer:
                 # Load data
                 train_data = next(train_iter)
                 
-                rgb_gt = train_data["rgb"].permute(0,3,1,2)
-                # depth_gt = train_data["depth"].permute(0,3,1,2)
-                # normal_gt = train_data["normal"].permute(0,3,1,2)
-                # mask_gt = train_data["mask"].permute(0,3,1,2)
-                # albedo_gt = train_data["albedo"].permute(0,3,1,2)
-                # roughness_gt = train_data["roughness"].permute(0,3,1,2)
-                # specular_gt = train_data["specular"].permute(0,3,1,2)
-                
                 # Skip data without prompt records
                 if train_data["prompt"] == "0":
                     continue
                     
                 # Prompt embedding + pose embedding
                 prompt_embeds = self.compel(train_data["prompt"])
-                # last_idx = prompt_embeds.shape[1] - 1
+                last_idx = prompt_embeds.shape[1] - 1
                 
-                # # Pose encoding
-                # fourier_feats = self.fourier_encode(x=train_data["rotation"], num_bands=128)
-                # pose_embeds = self.pose_encoder(torch.cat([train_data["rotation"],fourier_feats], dim=-1))
-                # prompt_embeds[:, last_idx, :] = prompt_embeds[:, last_idx, :] + pose_embeds
+                # Pose encoding
+                fourier_feats = self.fourier_encode(x=train_data["rotation"], num_bands=128)
+                pose_embeds = self.pose_encoder(torch.cat([train_data["rotation"],fourier_feats], dim=-1))
+                prompt_embeds[:, last_idx, :] = prompt_embeds[:, last_idx, :] + pose_embeds
 
                 # Finetune unet model
                 # 1. Use pretrained vae to get the encoded latents of samples
                 with torch.no_grad():
+                    input_list = [
+                        train_data["rgb"],
+                        train_data["depth"], 
+                        train_data["normal"],
+                        train_data["albedo"],
+                        train_data["roughness"],
+                        train_data["specular"],
+                        train_data["mask"]
+                    ]
+                    model_input = torch.cat(input_list, dim=-1).permute(0,3,1,2)
                     
-                    model_input = (rgb_gt - 0.5) / 0.5
-                    
-                    posterior = self.vae.encode(model_input).latent_dist
+                    posterior = self.vae_shader.vae.encode(model_input).latent_dist
                     latents = posterior.sample()
-                    # latents = (latents - self.shift_factor[None,:,None,None].to(latents.device)) * \
-                    #     self.scaling_factor[None,:,None,None].to(latents.device)
-                    latents = latents * self.vae.config.scaling_factor
+                    latents = (latents - self.shift_factor[None,:,None,None].to(latents.device)) * \
+                        self.scaling_factor[None,:,None,None].to(latents.device)
                 
                 # 2. Sample noise that we'll add to the latents
                 B, C, H, W = latents.shape
@@ -571,20 +566,18 @@ class Trainer:
         
         # Train loop for unet
         self.unet.eval()
-        self.vae.eval()
-        # self.pose_encoder.eval()
+        self.vae_shader.eval()
+        self.pose_encoder.eval()
         total_eval_loss = 0.
         total_psnr = 0.
         total_ssim = 0.
         total_lpips = 0.
         save_out_row_list = []
-        eval_num = 10
+        eval_num = 2
         progress_bar = tqdm(range(eval_num), ncols=90, disable=not self.accelerator.is_local_main_process)
         for step in progress_bar:
             # Load data
             eval_data = next(eval_iter)
-            
-            rgb_gt = eval_data["rgb"].permute(0,3,1,2)
                 
             # Skip data without prompt records
             if eval_data["prompt"] == "0":
@@ -592,21 +585,30 @@ class Trainer:
             
             # Prompt embedding + pose embedding
             prompt_embeds = self.compel(eval_data["prompt"])
-            # last_idx = prompt_embeds.shape[1] - 1
+            last_idx = prompt_embeds.shape[1] - 1
             
-            # # Pose encoding
-            # fourier_feats = self.fourier_encode(x=eval_data["rotation"], num_bands=128)
-            # pose_embeds = self.pose_encoder(torch.cat([eval_data["rotation"],fourier_feats], dim=-1))
-            # prompt_embeds[:, last_idx, :] = prompt_embeds[:, last_idx, :] + pose_embeds
+            # Pose encoding
+            fourier_feats = self.fourier_encode(x=eval_data["rotation"], num_bands=128)
+            pose_embeds = self.pose_encoder(torch.cat([eval_data["rotation"],fourier_feats], dim=-1))
+            prompt_embeds[:, last_idx, :] = prompt_embeds[:, last_idx, :] + pose_embeds
 
             # Finetune unet model
             # 1. Use pretrained vae to get the encoded latents of samples
+            input_list = [
+                eval_data["rgb"],
+                eval_data["depth"], 
+                eval_data["normal"],
+                eval_data["albedo"],
+                eval_data["roughness"],
+                eval_data["specular"],
+                eval_data["mask"]
+            ]
+            model_input = torch.cat(input_list, dim=-1).permute(0,3,1,2)
             
-            model_input = (rgb_gt - 0.5) / 0.5
-            
-            posterior = self.vae.encode(model_input).latent_dist
+            posterior = self.vae_shader.vae.encode(model_input).latent_dist
             latents = posterior.sample()
-            latents = latents * self.vae.config.scaling_factor
+            latents = (latents - self.shift_factor[None,:,None,None].to(latents.device)) * \
+                self.scaling_factor[None,:,None,None].to(latents.device)
             
             # 2. Sample noise that we'll add to the latents
             B, C, H, W = latents.shape
@@ -682,45 +684,38 @@ class Trainer:
             # Sample test images
             # Prompt embedding + pose embedding
             prompt_embeds = self.compel(eval_data["prompt"])
-            # last_idx = prompt_embeds.shape[1] - 1
+            last_idx = prompt_embeds.shape[1] - 1
             
-            # # Pose encoding
-            # fourier_feats = self.fourier_encode(x=eval_data["rotation"], num_bands=128)
-            # pose_embeds = self.pose_encoder(torch.cat([eval_data["rotation"],fourier_feats], dim=-1))
-            # prompt_embeds[:, last_idx, :] = prompt_embeds[:, last_idx, :] + pose_embeds
+            # Pose encoding
+            fourier_feats = self.fourier_encode(x=eval_data["rotation"], num_bands=128)
+            pose_embeds = self.pose_encoder(torch.cat([eval_data["rotation"],fourier_feats], dim=-1))
+            prompt_embeds[:, last_idx, :] = prompt_embeds[:, last_idx, :] + pose_embeds
             
             latents = self.pipeline(prompt_embeds=prompt_embeds, 
                                     height=self.height, width=self.width,
                                     num_inference_steps=20, 
                                     generator=self.generator, 
                                     output_type="latent").images
-            latents = latents / self.vae.config.scaling_factor
+            latents = latents / self.scaling_factor[None,:,None,None].to(latents.device) + \
+                self.shift_factor[None,:,None,None].to(latents.device)
             
-            rgb_pred = self.pipeline.vae.decode(latents).sample
-            rgb_pred = (rgb_pred / 2 + 0.5).clamp(0,1)
+            geo_output, mat_output, _ = self.vae_shader.vae.decode(latents)
             
-            save_out_row_list.append([rgb_pred])
+            rgb_pred = geo_output[:,:3]
+            depth_pred = geo_output[:,3]
+            normal_pred = geo_output[:,4:7]
+            mask_pred = geo_output[:,7]
+            albedo_pred = mat_output[:,:3]
+            roughness_pred = mat_output[:,3]
+            metallic_pred = mat_output[:,4]
             
-            # geo_output, mat_output, _ = self.vae.decode(latents).sample
-            
-            # geo_output = geo_output.clamp(0,1)
-            # mat_output = mat_output.clamp(0,1)
-            
-            # rgb_pred = geo_output[:,:3]
-            # depth_pred = geo_output[:,3]
-            # normal_pred = geo_output[:,4:7]
-            # mask_pred = geo_output[:,7]
-            # albedo_pred = mat_output[:,:3]
-            # roughness_pred = mat_output[:,3]
-            # metallic_pred = mat_output[:,4]
-            
-            # save_out_row_list.append([rgb_pred, 
-            #                           depth_pred[:,None].repeat(1,3,1,1), 
-            #                           normal_pred,
-            #                           albedo_pred,
-            #                           roughness_pred[:,None].repeat(1,3,1,1), 
-            #                           metallic_pred[:,None].repeat(1,3,1,1), 
-            #                           mask_pred[:,None].repeat(1,3,1,1)])
+            save_out_row_list.append([rgb_pred, 
+                                      depth_pred[:,None].repeat(1,3,1,1), 
+                                      normal_pred,
+                                      albedo_pred,
+                                      roughness_pred[:,None].repeat(1,3,1,1), 
+                                      metallic_pred[:,None].repeat(1,3,1,1), 
+                                      mask_pred[:,None].repeat(1,3,1,1)])
             
             # # Render image
             # denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + \
@@ -752,34 +747,34 @@ class Trainer:
             
             # save_out_row_list[-1].append(rgb_shading.permute(0,3,1,2))
             
-        # Compute metrics
-        avg_eval_loss = total_eval_loss / eval_num
-        # avg_psnr = total_psnr / eval_num
-        # avg_ssim = total_ssim / eval_num
-        # avg_lpips = total_lpips / eval_num
-        self.accelerator.log({
-            f"eval_{self.configs.train_phase}/eval_loss": avg_eval_loss.item(),
-            # f"eval_{self.configs.train_phase}/psnr": avg_psnr.item(),
-            # f"eval_{self.configs.train_phase}/ssim": avg_ssim.item(),
-            # f"eval_{self.configs.train_phase}/lpips": avg_lpips.item(),
-        }, step=self.global_step)
+            # Compute metrics
+            avg_eval_loss = total_eval_loss / eval_num
+            # avg_psnr = total_psnr / eval_num
+            # avg_ssim = total_ssim / eval_num
+            # avg_lpips = total_lpips / eval_num
+            self.accelerator.log({
+                f"eval_{self.configs.train_phase}/eval_loss": avg_eval_loss.item(),
+                # f"eval_{self.configs.train_phase}/psnr": avg_psnr.item(),
+                # f"eval_{self.configs.train_phase}/ssim": avg_ssim.item(),
+                # f"eval_{self.configs.train_phase}/lpips": avg_lpips.item(),
+            }, step=self.global_step)
 
-        # Evaluate the visual result and save the model
-        self.accelerator.wait_for_everyone()
-        if self.accelerator.is_main_process:
-            
-            # Save weights
-            torch.save(self.unet.state_dict(), f"{self.project_dir}/unet.pth")
-            torch.save(self.pose_encoder.state_dict(), f"{self.project_dir}/pose.pth")
-            
-            # Save samples
-            save_out_col_list = []
-            for save_out in save_out_row_list:
-                save_out_col_list.append(torch.cat(save_out,dim=2))
-            
-            save_out = torch.cat(save_out_col_list[:10], dim=3)[0]
-            
-            tvf.to_pil_image(save_out).save(f"{self.sample_dir}/sample_{self.configs.train_phase}_{self.global_step}.png")
+            # Evaluate the visual result and save the model
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                
+                # Save weights
+                torch.save(self.unet.state_dict(), f"{self.project_dir}/unet.pth")
+                torch.save(self.pose_encoder.state_dict(), f"{self.project_dir}/pose.pth")
+                
+                # Save samples
+                save_out_col_list = []
+                for save_out in save_out_row_list:
+                    save_out_col_list.append(torch.cat(save_out,dim=2))
+                
+                save_out = torch.cat(save_out_col_list[:10], dim=3)[0]
+                
+                tvf.to_pil_image(save_out).save(f"{self.sample_dir}/sample_{self.configs.train_phase}_{self.global_step}.png")
     
     # Helper functions
     def unwrap_model(self, model):

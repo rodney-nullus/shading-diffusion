@@ -26,9 +26,15 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.optimization import get_scheduler
 
 from dataloader.celeba_pbr import get_dataloader
-from models.vae_shader import VAE, NeuralShader
+from models.vae_shader import VAE
+from models.neural_renderer import NeuralRenderer
+
+from utils.io import load_hdr
 
 from loss.mask_loss import BCEDiceBoundaryLoss
+
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio
 
 from configs.training_configs_vae import Configs
 
@@ -44,7 +50,7 @@ class Trainer:
             self.width, self.height = configs.resolution, configs.resolution
         
         # Handle the repository creation
-        self.project_dir = f"{configs.output_dir}/{configs.exp_name}/{configs.train_model}"
+        self.project_dir = f"{configs.output_dir}/{configs.exp_name}"
         
         # Create checkpoint dir
         self.checkpoints_dir = os.path.join(self.project_dir, "checkpoints")
@@ -130,59 +136,59 @@ class Trainer:
         self.total_train_steps = self.total_train_epochs * self.num_update_steps_per_epoch
         self.total_batch_size = configs.train_batch_size * self.accelerator.num_processes * configs.gradient_accumulation_steps
         
-        vae = VAE(configs=configs)
+        vae_shader = VAE(configs=configs)
+        vae_shader.vae.requires_grad_(False)
+        vae_shader.vae.decoder.requires_grad_(True)
         
         # Intrinsics head: predicts focal length (f) and principal point offsets (cx, cy)
         # We global-pool features and regress 3 values
         intrinsic_net = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),   # [B,C,1,1]
             nn.Flatten(),              # [B,C]
-            nn.Linear(256, 64),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, 1)           # [f, cx, cy]
+            nn.Linear(64, 1)           # [f]
         )
         
-        trainable_params = list(vae.parameters()) + list(intrinsic_net.parameters())
+        neural_renderer = NeuralRenderer()
         
-        neural_shader = NeuralShader(width=256, height=256)
+        if configs.train_phase == "vae":
+            trainable_params = list(p for p in vae_shader.vae.parameters() if p.requires_grad) + list(intrinsic_net.parameters())
+            optimizer = torch.optim.AdamW(trainable_params, lr=configs.learning_rate)
+        elif configs.train_phase == "ns":
+            optimizer = torch.optim.AdamW(neural_renderer.parameters(), lr=configs.learning_rate)
+        else:
+            raise RuntimeError("Train phase should be 'vae' or 'ns'.")
         
-        if configs.train_phase == "ns":
-            trainable_params = list(neural_shader.parameters())
-        
-        optimizer = torch.optim.AdamW(trainable_params, lr=configs.learning_rate)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.total_train_epochs)
         
         # Prepare everything
         # There is no specific order to remember, you just need to unpack the
         # objects in the same order you gave them to the prepare method.
-        (self.vae, 
+        (self.vae_shader, 
          self.intrinsic_net,
-         self.neural_shader,
+         self.neural_renderer,
          self.optimizer, 
          self.lr_scheduler, 
          self.train_loader, 
-         self.eval_loader) = self.accelerator.prepare(vae, intrinsic_net, neural_shader, optimizer, lr_scheduler, train_loader, eval_loader)
+         self.eval_loader) = self.accelerator.prepare(vae_shader, intrinsic_net, neural_renderer, optimizer, lr_scheduler, train_loader, eval_loader)
         
         if configs.train_phase == "ns":
             # Load pretrained weights from vae phase
-            dirs = os.listdir(self.checkpoints_dir)
-            dirs = [d for d in dirs if d.startswith(f"checkpoint-vae")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[2]))
+            dirs = os.listdir(self.project_dir)
+            dirs = [d for d in dirs if d.startswith(f"vae")]
             path = dirs[-1] if len(dirs) > 0 else None
             
             if path is None:
-                self.accelerator.print(
-                    f"Checkpoint '{self.configs.resume_from_checkpoint}' does not exist"
-                )
-                raise
+                raise RuntimeError("VAE weights does not exist.")
             else:
                 # vae_weights = torch.load(f"{self.project_dir}/vae.pth")
-                vae_weights = torch.load("experiments/exp_19_vae/vae.pth")
-                self.vae.load_state_dict(vae_weights)
+                vae_weights = torch.load(f"experiments/exp_27/vae.pth")
+                self.vae_shader.load_state_dict(vae_weights)
         
         self.train_resize = transforms.Resize((self.height, self.width), interpolation=transforms.InterpolationMode.BILINEAR)
         self.train_crop = transforms.CenterCrop((self.height, self.width)) if configs.center_crop else transforms.RandomCrop(configs.resolution)
@@ -190,10 +196,16 @@ class Trainer:
         self.train_transforms = transforms.Compose([transforms.Normalize([0.5], [0.5])])
         self.bce_loss = BCEDiceBoundaryLoss()
         
+        # Metrics
+        self.psnr = PeakSignalNoiseRatio().to(self.device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='squeeze').to(self.device)
+        
     def train(self):
         
         # Initial log
         self.logger.info("***** Running training *****")
+        self.logger.info(f"  Training backbone: {self.configs.pretrained_model_name_or_path}")
         self.logger.info(f"  Num examples = {len(self.train_loader)}")
         self.logger.info(f"  Num Epochs = {self.total_train_epochs}")
         self.logger.info(f"  Instantaneous batch size per device = {self.configs.train_batch_size}")
@@ -234,6 +246,8 @@ class Trainer:
             self.global_step = 0
             current_epoch = 0
         
+        self.count = 0
+        
         # Epoch loop
         while True:
             
@@ -260,6 +274,7 @@ class Trainer:
                         break
                 
                 current_epoch += 1
+                self.count += 1
         
         self.accelerator.end_training()
     
@@ -269,7 +284,7 @@ class Trainer:
         train_iter = iter(self.train_loader)
         
         # Train loop for vae
-        self.vae.train()
+        self.vae_shader.train()
         train_loss = 0.0
         progress_bar = tqdm(
             range(self.initial_step, len(self.train_loader)),
@@ -279,98 +294,155 @@ class Trainer:
             disable=not self.accelerator.is_local_main_process
         )
         for step in progress_bar:
-            with self.accelerator.accumulate(self.vae):
+            with self.accelerator.accumulate(self.vae_shader):
                 # Load data
                 train_data = next(train_iter)
-
-                input_list = [
-                    train_data["rgb"],
-                    train_data["depth"], 
-                    train_data["normal"],
-                    train_data["albedo"],
-                    train_data["roughness"],
-                    train_data["specular"],
-                    train_data["mask"]
-                ]
-                model_input = torch.cat(input_list, dim=-1).permute(0,3,1,2)
                 
                 rgb_gt = train_data["rgb"].permute(0,3,1,2)
+                depth_gt = train_data["depth"].permute(0,3,1,2)
+                normal_gt = train_data["normal"].permute(0,3,1,2)
+                mask_gt = train_data["mask"].permute(0,3,1,2)
+                albedo_gt = train_data["albedo"].permute(0,3,1,2)
+                roughness_gt = train_data["roughness"].permute(0,3,1,2)
+                specular_gt = train_data["specular"].permute(0,3,1,2)
                 
-                geo_output, mat_output, mat_feature_list, kl_loss = self.vae(input=model_input.to(self.weight_dtype))
+                fov_gt = train_data["fov"]
                 
-                # Estimate fov
-                intrinsic_pred = self.intrinsic_net(mat_feature_list[-1])
-                fov_norm = nn.functional.sigmoid(intrinsic_pred[:,0])
-                fov_pred = fov_norm * 180
+                if self.configs.train_phase == "vae":
                 
-                # Depth denormailze
-                depth_pred = geo_output[:,3]
-                denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + self.configs.z_near) * train_data["mask"].squeeze()
-                
-                # Camera position reconstruction
-                cam_pos_pred = self.get_cam_coords(denorm_depth.unsqueeze(1), width=rgb_gt.shape[3], height=rgb_gt.shape[2], fov=fov_pred)
-                cam_pos_pred[...,:2] = cam_pos_pred[...,:2] / 80.
-                cam_pos_pred[...,2] = - cam_pos_pred[...,2] / 800.
-
-                # Compute loss
-                rgbd_gt = torch.cat([rgb_gt, train_data["depth"].permute(0,3,1,2)], dim=1)
-                rgbd_loss = nn.functional.l1_loss(geo_output[:,:4], rgbd_gt)
-                
-                fov_loss = nn.functional.l1_loss(torch.log10(fov_pred), torch.log10(train_data["fov"].float()))
-                
-                normal_pred = geo_output[:,4:7]
-                normal_loss = 1 - nn.functional.cosine_similarity(normal_pred, train_data["normal"].permute(0,3,1,2)).mean()
-                
-                mask_pred = geo_output[:,7]
-                mask_loss = self.bce_loss(mask_pred.unsqueeze(1), train_data["mask"].permute(0,3,1,2))
-                
-                cam_pos_loss = nn.functional.l1_loss(cam_pos_pred, train_data["cam_coords"])
-                
-                mat_loss = nn.functional.mse_loss(mat_output, model_input[:,7:12])
-                
-                total_loss = rgbd_loss + normal_loss + fov_loss + mask_loss + mat_loss + 0.000001 * kl_loss
-                
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = self.accelerator.gather(total_loss.repeat(self.configs.train_batch_size)).mean()
-                train_loss += avg_loss.item() / self.configs.gradient_accumulation_steps
-                
-                log_dict = {
-                    f"train_{self.configs.train_phase}/total_loss": total_loss.item(),
-                    f"train_{self.configs.train_phase}/rgbd_loss": rgbd_loss.item(),
-                    f"train_{self.configs.train_phase}/normal_loss": normal_loss.item(),
-                    f"train_{self.configs.train_phase}/fov_loss": fov_loss.item(),
-                    f"train_{self.configs.train_phase}/cam_pos_loss": cam_pos_loss.item(),
-                    f"train_{self.configs.train_phase}/mat_loss": mat_loss.item(),
-                    f"train_{self.configs.train_phase}/mask_loss": mask_loss.item(),
-                    f"train_{self.configs.train_phase}/kl_loss": 0.000001 * kl_loss.item()
-                }
-                
-                if self.configs.train_phase == "ns":
+                    (rgb_pred, 
+                     depth_pred, 
+                     normal_pred, 
+                     mask_pred,
+                     albedo_pred,
+                     roughness_pred,
+                     specular_pred,
+                     kl_loss,
+                     mat_feature) = self.vae_shader((rgb_gt-0.5)/0.5)
                     
-                    shading_rgb = self.neural_shader(depth_map=depth_pred,
-                                             fov=10.,
-                                             mat_map=mat_output,
-                                             normal_map=normal_pred,
-                                             mask=mask_pred, env_map=train_data["hdri"])
+                    # rgb loss
+                    rgb_loss = nn.functional.l1_loss(rgb_pred, rgb_gt)
                     
-                    total_loss = nn.functional.l1_loss(train_data["rgb"], shading_rgb)
+                    # depth loss
+                    depth_loss = nn.functional.l1_loss(depth_pred, depth_gt)
+                    
+                    # normal loss
+                    normal_loss = 1 - nn.functional.cosine_similarity(normal_pred, normal_gt).mean()
+                    
+                    # mask loss
+                    mask_loss = self.bce_loss(mask_pred, mask_gt)
+                    
+                    mat_loss = 0
+                    # albedo loss
+                    mat_loss += nn.functional.mse_loss(albedo_pred, albedo_gt)
+                    
+                    # roughness loss
+                    mat_loss += nn.functional.mse_loss(roughness_pred, roughness_gt)
+                    
+                    # specular loss
+                    mat_loss += nn.functional.mse_loss(specular_pred, specular_gt)
+                    
+                    # fov loss
+                    # Estimate fov
+                    intrinsic_pred = self.intrinsic_net(mat_feature)
+                    fov_norm = nn.functional.sigmoid(intrinsic_pred[:,0])
+                    fov_pred = fov_norm * 180
+                    
+                    # Depth denormailze
+                    denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + self.configs.z_near) * mask_pred
+                    
+                    # Camera position reconstruction
+                    cam_pos_pred = self.get_cam_coords(denorm_depth, width=self.width, height=self.height, fov=fov_pred)
+                    cam_pos_pred[...,:2] = cam_pos_pred[...,:2] / 80.
+                    cam_pos_pred[...,2] = cam_pos_pred[...,2] / 800.
+                    
+                    fov_loss = nn.functional.l1_loss(torch.log10(fov_pred), torch.log10(fov_gt.float()))
+                    
+                    cam_pos_loss = nn.functional.l1_loss(cam_pos_pred, train_data["cam_coords"])
+                    
+                    
+                    
+                    total_loss = rgb_loss + depth_loss + normal_loss + \
+                        mask_loss + mat_loss + fov_loss
                     
                     # Gather the losses across all processes for logging (if we use distributed training).
                     avg_loss = self.accelerator.gather(total_loss.repeat(self.configs.train_batch_size)).mean()
                     train_loss += avg_loss.item() / self.configs.gradient_accumulation_steps
                     
                     log_dict = {
-                        f"train_{self.configs.train_phase}/total_loss": total_loss.item()
+                        f"train_{self.configs.train_phase}/total_loss": total_loss.item(),
+                        f"train_{self.configs.train_phase}/rgb_loss": rgb_loss.item(),
+                        f"train_{self.configs.train_phase}/depth_loss": depth_loss.item(),
+                        f"train_{self.configs.train_phase}/normal_loss": normal_loss.item(),
+                        f"train_{self.configs.train_phase}/mask_loss": mask_loss.item(),
+                        f"train_{self.configs.train_phase}/mat_loss": mat_loss.item(),
+                        f"train_{self.configs.train_phase}/fov_loss": fov_loss.item(),
+                        f"train_{self.configs.train_phase}/cam_pos_loss": cam_pos_loss.item(),
+                        # f"train_{self.configs.train_phase}/kl_loss": 0.000001 * kl_loss.item()
+                    }
+                    
+                    # Backpropagate
+                    self.accelerator.backward(total_loss)
+                    if self.accelerator.sync_gradients:
+                        params_to_clip = self.vae_shader.parameters()
+                        self.accelerator.clip_grad_norm_(params_to_clip, self.configs.max_grad_norm)
+                    self.optimizer.step()
+                    
+                    self.optimizer.zero_grad()
+                
+                elif self.configs.train_phase == "ns":
+                    
+                    with torch.no_grad():
+                        (rgb_pred, 
+                         depth_pred, 
+                         normal_pred, 
+                         mask_pred,
+                         albedo_pred,
+                         roughness_pred,
+                         specular_pred,
+                         kl_loss,
+                         mat_feature_list) = self.vae_shader(rgb_gt)
+                    
+                    denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + \
+                        self.configs.z_near) * mask_pred
+                    
+                    fov = torch.tensor(85., device=depth_pred.device)[None].repeat(depth_pred.shape[0])
+                    cam_pos_pred = self.get_cam_coords(denorm_depth.unsqueeze(1), width=self.width, height=self.height, fov=fov)
+                    mask = mask_pred.squeeze(1).bool()
+                    normal_pred = (normal_pred * 2) - 1.
+                    
+                    render_buffer = {
+                        "rgb_gt": rgb_gt.permute(0,2,3,1),
+                        "normal_gt": normal_pred.permute(0,2,3,1),
+                        "albedo_gt": albedo_pred.permute(0,2,3,1),
+                        "roughness_gt": roughness_pred.permute(0,2,3,1),
+                        "specular_gt": specular_pred.permute(0,2,3,1),
+                        "pos_in_cam_gt": cam_pos_pred,
+                        "hdri_gt": train_data["hdri"],
+                        "mask": mask
+                    }
+                    
+                    rgb_shading, rand_indices = self.neural_renderer(render_buffer=render_buffer, num_light_samples=128, inference=False)
+                    
+                    total_loss = nn.functional.l1_loss(train_data["rgb"][mask][rand_indices], rgb_shading)
+                    # total_loss = nn.functional.l1_loss(train_data["rgb"][mask], rgb_shading)
+                    
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    avg_loss = self.accelerator.gather(total_loss.repeat(self.configs.train_batch_size)).mean()
+                    train_loss += avg_loss.item() / self.configs.gradient_accumulation_steps
+                    
+                    log_dict = {
+                        f"train_{self.configs.train_phase}/rendering_loss": total_loss.item()
                     }
                 
-                # Backpropagate
-                self.accelerator.backward(total_loss)
-                if self.accelerator.sync_gradients:
-                    params_to_clip = self.vae.parameters()
-                    self.accelerator.clip_grad_norm_(params_to_clip, self.configs.max_grad_norm)
-                self.optimizer.step()
-                
-                self.optimizer.zero_grad()
+                    # Backpropagate
+                    self.accelerator.backward(total_loss)
+                    if self.accelerator.sync_gradients:
+                        params_to_clip = self.neural_renderer.parameters()
+                        self.accelerator.clip_grad_norm_(params_to_clip, self.configs.max_grad_norm)
+                    self.optimizer.step()
+                    
+                    self.optimizer.zero_grad()
                 
                 # Logs
                 logs = {"loss": train_loss}
@@ -392,138 +464,220 @@ class Trainer:
         eval_iter = iter(self.eval_loader)
         
         # Train loop for unet
-        self.vae.eval()
-        eval_loss = 0.
-        rgbd_loss = 0.
-        normal_loss = 0.
-        fov_loss = 0.
-        cam_pos_loss = 0.
-        mat_loss = 0.
-        mask_loss = 0.
-        eval_num = 1
+        self.vae_shader.eval()
+        total_eval_loss = 0.
+        total_rgb_loss = 0.
+        total_depth_loss = 0.
+        total_normal_loss = 0.
+        total_fov_loss = 0.
+        total_cam_pos_loss = 0.
+        total_mat_loss = 0.
+        total_mask_loss = 0.
+        total_psnr = 0.
+        total_ssim = 0.
+        total_lpips = 0.
+        save_out_row_list = []
+        eval_num = 5
         progress_bar = tqdm(range(eval_num), ncols=90, disable=not self.accelerator.is_local_main_process)
         for step in progress_bar:
             # Load data
             eval_data = next(eval_iter)
             
-            input_list = [
-                eval_data["rgb"],
-                eval_data["depth"], 
-                eval_data["normal"],
-                eval_data["albedo"],
-                eval_data["roughness"],
-                eval_data["specular"],
-                eval_data["mask"]
-            ]
-            model_input = torch.cat(input_list, dim=-1).permute(0,3,1,2)
-            
             rgb_gt = eval_data["rgb"].permute(0,3,1,2)
+            depth_gt = eval_data["depth"].permute(0,3,1,2)
+            normal_gt = eval_data["normal"].permute(0,3,1,2)
+            mask_gt = eval_data["mask"].permute(0,3,1,2)
+            albedo_gt = eval_data["albedo"].permute(0,3,1,2)
+            roughness_gt = eval_data["roughness"].permute(0,3,1,2)
+            specular_gt = eval_data["specular"].permute(0,3,1,2)
             
-            geo_output, mat_output, mat_feature_list, kl_loss = self.vae(model_input.to(self.weight_dtype))
+            fov_gt = eval_data["fov"]
             
-            rgb_pred = geo_output[:,:3]
-            depth_pred = geo_output[:,3]
-            normal_pred = geo_output[:,4:7]
-            mask_pred = geo_output[:,7]
+            (rgb_pred, 
+             depth_pred, 
+             normal_pred, 
+             mask_pred,
+             albedo_pred,
+             roughness_pred,
+             specular_pred,
+             kl_loss,
+             mat_feature) = self.vae_shader((rgb_gt-0.5)/0.5)
             
-            # Estimate fov
-            intrinsic_pred = self.intrinsic_net(mat_feature_list[-1])
-            fov_norm = nn.functional.sigmoid(intrinsic_pred[:,0])
-            fov_pred = fov_norm * 180
+            save_out_row_list.append([rgb_pred, 
+                                      depth_pred.repeat(1,3,1,1), 
+                                      normal_pred,
+                                      albedo_pred,
+                                      roughness_pred.repeat(1,3,1,1), 
+                                      specular_pred.repeat(1,3,1,1), 
+                                      mask_pred.repeat(1,3,1,1)])
             
-            # Depth denormailze
-            denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + self.configs.z_near) * eval_data["mask"].squeeze()
+            if self.configs.train_phase == "vae":
+                # rgb loss
+                rgb_loss = nn.functional.l1_loss(rgb_pred, rgb_gt)
+                total_rgb_loss += rgb_loss
+                
+                # depth loss
+                depth_loss = nn.functional.l1_loss(depth_pred, depth_gt)
+                total_depth_loss += depth_loss
+                
+                # normal loss
+                normal_loss = 1 - nn.functional.cosine_similarity(normal_pred, normal_gt).mean()
+                total_normal_loss += normal_loss
+                
+                # mask loss
+                mask_loss = self.bce_loss(mask_pred.unsqueeze(1), mask_gt.unsqueeze(1))
+                total_mask_loss += mask_loss
+                
+                mat_loss = 0
+                # albedo loss
+                mat_loss += nn.functional.mse_loss(albedo_pred, albedo_gt)
+                
+                # roughness loss
+                mat_loss += nn.functional.mse_loss(roughness_pred, roughness_gt)
+                
+                # specular loss
+                mat_loss += nn.functional.mse_loss(specular_pred, specular_gt)
+                total_mat_loss += mat_loss
+                
+                # fov loss
+                # Estimate fov
+                intrinsic_pred = self.intrinsic_net(mat_feature)
+                fov_norm = nn.functional.sigmoid(intrinsic_pred[:,0])
+                fov_pred = fov_norm * 180
+                
+                # Depth denormailze
+                denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + self.configs.z_near) * mask_pred
+                
+                # Camera position reconstruction
+                cam_pos_pred = self.get_cam_coords(denorm_depth.unsqueeze(1), width=self.width, height=self.height, fov=fov_pred)
+                cam_pos_pred[...,:2] = cam_pos_pred[...,:2] / 80.
+                cam_pos_pred[...,2] = cam_pos_pred[...,2] / 800.
+                
+                fov_loss = nn.functional.l1_loss(torch.log10(fov_pred), torch.log10(fov_gt.float()))
+                total_fov_loss += fov_loss
+                
+                cam_pos_loss = nn.functional.l1_loss(cam_pos_pred, eval_data["cam_coords"])
+                total_cam_pos_loss += cam_pos_loss
+                
+                total_eval_loss += rgb_loss + depth_loss + normal_loss + \
+                        mask_loss + mat_loss + fov_loss + 0.000001 * kl_loss
             
-            # Camera position reconstruction
-            cam_pos_pred = self.get_cam_coords(denorm_depth.unsqueeze(1), width=rgb_gt.shape[3], height=rgb_gt.shape[2], fov=fov_pred)
-            cam_pos_pred[...,:2] = cam_pos_pred[...,:2] / 80.
-            cam_pos_pred[...,2] = - cam_pos_pred[...,2] / 800.
-            
-            # Compute metrics
-            rgbd_gt = torch.cat([rgb_gt, eval_data["depth"].permute(0,3,1,2)], dim=1)
-            rgbd_loss += nn.functional.l1_loss(geo_output[:,:4], rgbd_gt)
-            
-            fov_loss += nn.functional.l1_loss(torch.log10(fov_pred), torch.log10(eval_data["fov"].float()))
-            
-            normal_loss += 1 - nn.functional.cosine_similarity(normal_pred, eval_data["normal"].permute(0,3,1,2)).mean()
-            
-            mask_loss += self.bce_loss(mask_pred.unsqueeze(1), eval_data["mask"].permute(0,3,1,2))
-            
-            cam_pos_loss += nn.functional.l1_loss(cam_pos_pred, eval_data["cam_coords"])
-            
-            mat_loss += nn.functional.mse_loss(mat_output, model_input[:,7:12])
-            
-            eval_loss += rgbd_loss + normal_loss + fov_loss + mask_loss + mat_loss + 0.000001 * kl_loss
+            elif self.configs.train_phase == "ns":
+                
+                denorm_depth = (depth_pred * (self.configs.z_far - self.configs.z_near) + \
+                        self.configs.z_near) * mask_pred
+                    
+                fov = torch.tensor(85., device=depth_pred.device)[None].repeat(depth_pred.shape[0])
+                cam_pos_pred = self.get_cam_coords(denorm_depth.unsqueeze(1), width=self.width, height=self.height, fov=fov)
+                mask = mask_pred.squeeze(1).bool()
+                normal_pred = (normal_pred * 2) - 1.
+                
+                # Reconstruction rendering
+                render_buffer = {
+                    "rgb_gt": rgb_gt.permute(0,2,3,1),
+                    "normal_gt": normal_pred.permute(0,2,3,1),
+                    "albedo_gt": albedo_pred.permute(0,2,3,1),
+                    "roughness_gt": roughness_pred.permute(0,2,3,1),
+                    "specular_gt": specular_pred.permute(0,2,3,1),
+                    "pos_in_cam_gt": cam_pos_pred,
+                    "hdri_gt": eval_data["hdri"],
+                    "mask": mask
+                }
+                
+                rgb_shading = torch.ones(1,self.width,self.height,3,device=self.device)
+                shading_result, _ = self.neural_renderer(render_buffer=render_buffer, num_light_samples=128, inference=True)
+                rgb_shading[mask] = shading_result
+                rgb_shading = rgb_shading.permute(0,3,1,2)
+                
+                save_out_row_list[-1].append(rgb_shading)
+                
+                # Compute metrics
+                total_eval_loss += nn.functional.l1_loss(rgb_gt, rgb_shading)
+                total_psnr += self.psnr(rgb_shading, rgb_gt)
+                total_ssim += self.ssim(rgb_shading, rgb_gt)
+                total_lpips += self.lpips(rgb_shading, rgb_gt)
+                
+                # Relighting rendering
+                test_hdri = load_hdr("dataset/hdri/02.exr", resize=False).to(self.device)[None]
+                
+                render_buffer = {
+                    "rgb_gt": rgb_gt.permute(0,2,3,1),
+                    "normal_gt": normal_pred.permute(0,2,3,1),
+                    "albedo_gt": albedo_pred.permute(0,2,3,1),
+                    "roughness_gt": roughness_pred.permute(0,2,3,1),
+                    "specular_gt": specular_pred.permute(0,2,3,1),
+                    "pos_in_cam_gt": cam_pos_pred,
+                    "hdri_gt": test_hdri,
+                    "mask": mask
+                }
+                
+                rgb_relighting = torch.ones(1,self.width,self.height,3,device=self.device)
+                shading_result, _ = self.neural_renderer(render_buffer=render_buffer, num_light_samples=128, inference=True)
+                rgb_relighting[mask] = shading_result
+                rgb_relighting = rgb_relighting.permute(0,3,1,2)
+                
+                save_out_row_list[-1].append(rgb_relighting)
         
         # Compute average metrics
-        avg_eval_loss = eval_loss / eval_num
-        avg_rgbd_loss = rgbd_loss / eval_num
-        avg_fov_loss = fov_loss / eval_num
-        avg_cpos_loss = cam_pos_loss / eval_num
-        avg_normal_loss = normal_loss / eval_num
-        avg_mat_loss = mat_loss / eval_num
-        avg_mask_loss = mask_loss / eval_num
-        self.accelerator.log({
-            f"eval_{self.configs.train_phase}/eval_loss": avg_eval_loss.item(),
-            f"eval_{self.configs.train_phase}/rgbd_loss": avg_rgbd_loss.item(),
-            f"eval_{self.configs.train_phase}/fov_loss": avg_fov_loss.item(),
-            f"eval_{self.configs.train_phase}/cam_pos_loss": avg_cpos_loss.item(),
-            f"eval_{self.configs.train_phase}/normal_loss": avg_normal_loss.item(),
-            f"eval_{self.configs.train_phase}/mat_loss": avg_mat_loss.item(),
-            f"eval_{self.configs.train_phase}/mask_loss": avg_mask_loss.item()
-        }, step=self.global_step)
+        if self.configs.train_phase == "vae":
+            avg_eval_loss = total_eval_loss / eval_num
+            avg_rgbd_loss = total_rgb_loss / eval_num
+            avg_fov_loss = total_fov_loss / eval_num
+            avg_cpos_loss = total_cam_pos_loss / eval_num
+            avg_normal_loss = total_normal_loss / eval_num
+            avg_mat_loss = total_mat_loss / eval_num
+            avg_mask_loss = total_mask_loss / eval_num
+            
+            log_dict = {
+                f"eval_{self.configs.train_phase}/eval_loss": avg_eval_loss.item(),
+                f"eval_{self.configs.train_phase}/rgbd_loss": avg_rgbd_loss.item(),
+                f"eval_{self.configs.train_phase}/fov_loss": avg_fov_loss.item(),
+                f"eval_{self.configs.train_phase}/cam_pos_loss": avg_cpos_loss.item(),
+                f"eval_{self.configs.train_phase}/normal_loss": avg_normal_loss.item(),
+                f"eval_{self.configs.train_phase}/mat_loss": avg_mat_loss.item(),
+                f"eval_{self.configs.train_phase}/mask_loss": avg_mask_loss.item()
+            }
+        elif self.configs.train_phase == "ns":
+            avg_eval_loss = total_eval_loss / eval_num
+            avg_psnr = total_psnr / eval_num
+            avg_ssim = total_ssim / eval_num
+            avg_lpips = total_lpips / eval_num
+            
+            log_dict = {
+                f"eval_{self.configs.train_phase}/eval_loss": avg_eval_loss.item(),
+                f"eval_{self.configs.train_phase}/psnr": avg_psnr.item(),
+                f"eval_{self.configs.train_phase}/ssim": avg_ssim.item(),
+                f"eval_{self.configs.train_phase}/lpips": avg_lpips.item()
+            }
+        
+        self.accelerator.log(log_dict, step=self.global_step)
 
         # Evaluate the visual result and save the model
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             
-            # Save checkpoint firstly
-            torch.save(self.vae.state_dict(), f"{self.project_dir}/vae.pth")
-            torch.save(self.intrinsic_net.state_dict(), f"{self.project_dir}/intrinsic.pth")
-            
+            # Save weights
+            if self.configs.train_phase == "vae":
+                torch.save(self.vae_shader.state_dict(), f"{self.project_dir}/vae.pth")
+                torch.save(self.intrinsic_net.state_dict(), f"{self.project_dir}/intrinsic.pth")
+                
+            elif self.configs.train_phase == "ns":
+                torch.save(self.neural_renderer.state_dict(), f"{self.project_dir}/ns.pth")
+
             # Save samples
-            self.save_output_sample(rgb_pred, depth_pred, normal_pred, mask_pred, mat_output)
+            save_out_col_list = []
+            for save_out in save_out_row_list:
+                save_out_col_list.append(torch.cat(save_out,dim=2))
+            
+            save_out = torch.cat(save_out_col_list[:3], dim=3)[0]
+            
+            tvf.to_pil_image(save_out).save(f"{self.sample_dir}/sample_{self.configs.train_phase}_{self.global_step}.png")
     
     # Helper functions
     def unwrap_model(self, model):
         model = self.accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
-    
-    def save_output_sample(self, rgb, depth, normal, mask, mat):
-        
-        rgb_list = []
-        depth_list = []
-        normal_list = []
-        mask_list = []
-        albedo_list = []
-        roughness_list = []
-        specular_list = []
-        for i in range(10):
-            rgb_list.append(rgb[i])
-            depth_list.append(depth[i].repeat(3,1,1))
-            normal_list.append(normal[i])
-            mask_list.append(mask[i].repeat(3,1,1))
-            albedo_list.append(mat[i,:3])
-            roughness_list.append(mat[i,3].repeat(3,1,1))
-            specular_list.append(mat[i,4].repeat(3,1,1))
-        
-        rgb_o = torch.cat(rgb_list, dim=2)
-        depth_o = torch.cat(depth_list, dim=2)
-        normal_o = torch.cat(normal_list, dim=2)
-        mask_o = torch.cat(mask_list, dim=2)
-        albedo_o = torch.cat(albedo_list, dim=2)
-        roughness_o = torch.cat(roughness_list, dim=2)
-        specular_o = torch.cat(specular_list, dim=2)
-        
-        output = torch.cat([rgb_o, 
-                            depth_o, 
-                            normal_o, 
-                            albedo_o, 
-                            roughness_o, 
-                            specular_o, 
-                            mask_o], dim=1)
-        tvf.to_pil_image(output).save(f"{self.sample_dir}/sample_{self.configs.train_phase}_{self.global_step}.png")
     
     def save_checkpoint(self, with_lora=False):
         
@@ -566,7 +720,7 @@ class Trainer:
         Y, X = torch.meshgrid(Y, X, indexing="ij")
         cam_pos[..., 0] = depth.squeeze() * X[None,:,:] * torch.tan(fovx[:,None,None] / 2)
         cam_pos[..., 1] = depth.squeeze() * Y[None,:,:] * torch.tan(fovy[:,None,None] / 2)
-        cam_pos[..., 2] = depth.squeeze()
+        cam_pos[..., 2] = -depth.squeeze()
         return cam_pos
     
     def backproject(self, depth, intrinsics):

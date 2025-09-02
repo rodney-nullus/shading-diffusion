@@ -10,7 +10,8 @@ class Configs:
     # Experiment settings
     exp_name: str = "exp_15_unet"
     pretrained_model_name_or_path: str = "sd-legacy/stable-diffusion-v1-5"
-    resolution: Union[int, set] = 256
+    # pretrained_model_name_or_path: str = "lambdalabs/miniSD-diffusers"
+    resolution: Union[int, set] = 512
     random_seed: int = 0
     load_pretrained_vae: bool = False
     load_pretrained_unet: bool = False
@@ -39,14 +40,14 @@ class Configs:
     
     # Training settings
     train_model: str = ""                                       # `geo-diff`, `tex-diff`
-    train_phase: str = "unet"                                       # `vae`, `unet`
+    train_phase: str = "unet"                                   # `vae`, `unet`
     train_batch_size: int = 6
-    learning_rate: float = 5e-5
+    learning_rate: float = 1e-6
     scale_lr: bool = False
     lr_warmup_steps: int = 500
     lr_scheduler: str = "cosine_with_restarts"
     max_train_steps: int = None
-    total_train_epochs: int = 10
+    total_train_epochs: int = 20
     center_crop: bool = False
     random_flip: bool = False
     mixed_precision: str = "no"                                 # `no` for float32, `fp16` for automatic mixed precision
@@ -75,7 +76,7 @@ class Configs:
     checkpoints_total_limit: int = 5
     
     # Evaluation settings
-    eval_batch_size: int = 10                                   # how many images to sample during evaluation
+    eval_batch_size: int = 1                                    # how many images to sample during evaluation
     save_model_epochs: int = 1
     validation_prompts: str = ""
     
